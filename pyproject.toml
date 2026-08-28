@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-kanban-recovery-controller"
+version = "0.15.12"
+description = "Portable, instance-scoped foundation for manual Hermes Kanban blocker recovery"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Andre" }]
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8.3,<9"]
+
+[project.scripts]
+hkrc = "hkrc.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hkrc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-q"]

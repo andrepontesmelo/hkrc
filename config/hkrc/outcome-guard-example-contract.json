@@ -1,0 +1,21 @@
+{
+  "schema_version": "hkrc.outcome-contract.v1",
+  "contract_id": "example-prototype-selection",
+  "declared_outcome": "Operator selects one prototype after review",
+  "terminal_evidence": [
+    {
+      "evidence_type": "human_selection",
+      "evidence_ref": "prototype-choice"
+    }
+  ],
+  "allowed_effects": ["isolated_prototype"],
+  "continuation_policy": "stop",
+  "authority_source": {
+    "authority_id": "example-authority-1",
+    "kind": "operator",
+    "actor": "replace-with-operator-name",
+    "authorized_at": "2026-08-12T12:00:00+00:00",
+    "statement": "Authorize prototype selection only; nothing may be merged or deployed."
+  },
+  "parent_contract_refs": []
+}

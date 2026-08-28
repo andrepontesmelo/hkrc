@@ -1,0 +1,45 @@
+# Generated into <instance-root>/systemd/hkrc.service by hkrc_release.py.
+# This is a user-service artifact. Copy it to the selected user's service
+# directory and opt in explicitly; the release never installs, enables, or starts it.
+# This unit ships no stream connector or credentials. It is usable only after the
+# operator has configured an approved authenticated adapter and current-state
+# reader; otherwise `hkrc daemon` fails closed and never falls back to native DB
+# observation or CLI watch/tail parsing.
+[Unit]
+Description=Hermes Kanban blocker recovery controller (__INSTANCE_ROOT__)
+After=default.target
+
+[Service]
+Type=simple
+Environment="HKRC_INSTANCE_ROOT=__INSTANCE_ROOT__"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart="__WRAPPER__" daemon --config "__CONFIG__"
+WorkingDirectory=__WORKING_DIRECTORY__
+SyslogIdentifier=hkrc
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+KillMode=mixed
+# Native handoffs have a 120-second subprocess bound; leave time to stop cleanly.
+TimeoutStopSec=150s
+StandardOutput=journal
+StandardError=journal
+# These restrictions are compatible with a user service and the selected
+# instance: the controller writes only its state/workspace, while the native
+# do not restrict the user's home here because that would hide or block the
+# instance's home-scoped configuration and native CLI integration.
+ProtectSystem=full
+ReadWritePaths=__INSTANCE_ROOT_PATH__
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "HKRC Blocker Recovery Workflow",
+    "subtitle": "Evidence-backed discovery, one-ever reservation, native handoff, lead recovery, verification, and reporting",
+    "output": "artifacts/hkrc-recovery-workflow.html",
+    "animation": "none",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    { "id": "observation", "label": "Native Observation" },
+    { "id": "policy", "label": "Classification" },
+    { "id": "state", "label": "Controller State" },
+    { "id": "native", "label": "Native Handoff" },
+    { "id": "orchestration", "label": "Lead Orchestration" },
+    { "id": "outcome", "label": "Recovery Decision" },
+    { "id": "reporting", "label": "Verification + Reporting" },
+    { "id": "exceptions", "label": "Skipped Candidates", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "discover", "label": "Discover", "fromCol": 0, "toCol": 1 },
+    { "id": "reserve", "label": "Reserve", "fromCol": 2, "toCol": 2, "variant": "emphasis" },
+    { "id": "handoff", "label": "Handoff", "fromCol": 3, "toCol": 4, "variant": "emphasis" }
+  ],
+
+  "mainPath": [
+    "hkrc_scan",
+    "hkrc_classify",
+    "hkrc_reserve",
+    "hkrc_comment",
+    "hkrc_assign",
+    "hkrc_unblock",
+    "hkrc_lead",
+    "hkrc_decide",
+    "hkrc_verify_report"
+  ],
+  "nodes": [
+    { "id": "hkrc_scan", "lane": "observation", "col": 0, "width": 64, "type": "external", "label": "Scan", "sublabel": "boards; blocked" },
+    { "id": "hkrc_classify", "lane": "policy", "col": 1, "width": 64, "type": "backend", "label": "Classify", "sublabel": "typed + current" },
+    { "id": "hkrc_reserve", "lane": "state", "col": 2, "width": 64, "type": "database", "label": "Reserve", "sublabel": "one-ever key" },
+    { "id": "hkrc_comment", "lane": "native", "col": 3, "width": 64, "type": "backend", "label": "Comment", "sublabel": "fixed context" },
+    { "id": "hkrc_assign", "lane": "orchestration", "col": 4, "width": 64, "type": "backend", "label": "Assign", "sublabel": "lead profile" },
+    { "id": "hkrc_unblock", "lane": "native", "col": 5, "width": 64, "type": "security", "label": "Unblock", "sublabel": "official CLI" },
+    { "id": "hkrc_lead", "lane": "orchestration", "col": 5, "width": 64, "type": "external", "label": "Review", "sublabel": "recoverable?" },
+    { "id": "hkrc_decide", "lane": "outcome", "col": 5, "width": 64, "type": "backend", "label": "Decision", "sublabel": "resume or block" },
+    { "id": "hkrc_verify_report", "lane": "reporting", "col": 5, "width": 80, "type": "database", "label": "Record", "sublabel": "phase; stdout; error" },
+    { "id": "hkrc_skip", "lane": "exceptions", "col": 1, "width": 64, "type": "external", "label": "Skip", "sublabel": "stale / unknown" }
+  ],
+  "edges": [
+    { "from": "hkrc_scan", "to": "hkrc_classify", "role": "main" },
+    { "from": "hkrc_classify", "to": "hkrc_reserve", "variant": "emphasis", "role": "main" },
+    { "from": "hkrc_classify", "to": "hkrc_skip", "variant": "dashed", "role": "branch", "route": "drop", "fromSide": "bottom", "toSide": "top" },
+    { "from": "hkrc_reserve", "to": "hkrc_comment", "variant": "emphasis", "role": "main" },
+    { "from": "hkrc_comment", "to": "hkrc_assign", "role": "main", "route": "drop", "fromSide": "bottom", "toSide": "top" },
+    { "from": "hkrc_assign", "to": "hkrc_unblock", "role": "main" },
+    { "from": "hkrc_unblock", "to": "hkrc_lead", "variant": "emphasis", "role": "main", "route": "drop", "fromSide": "bottom", "toSide": "top" },
+    { "from": "hkrc_lead", "to": "hkrc_decide", "variant": "emphasis", "role": "main", "route": "drop", "fromSide": "bottom", "toSide": "top" },
+    { "from": "hkrc_decide", "to": "hkrc_verify_report", "variant": "emphasis", "role": "main", "route": "drop", "fromSide": "bottom", "toSide": "top" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Discovery Contract", "items": ["Read every non-archived board", "Require current blocked status and recency", "Stale, skipped, and unknown candidates are visible"] },
+    { "dot": "violet", "title": "Reservation Boundary", "items": ["Controller SQLite is separate from native boards", "Board + task identity is one-ever", "Reservation precedes native mutation"] },
+    { "dot": "emerald", "title": "Recovery Contract", "items": ["Comment, assign, then unblock through the official CLI", "Lead orchestrator decides resume versus re-block", "Native failure records the exact phase and stops; every candidate reports"] }
+  ]
+}

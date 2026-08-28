@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "description": "Expected Hermes cron jobs for the HKRC instance. Single source of truth consumed by `hkrc crons sync`: the sync creates missing jobs, resumes paused ones, and updates stale schedule/script/delivery/skill fields for matching names. Jobs not listed here are never touched. Deploy is operator-controlled: the release runs `hkrc crons sync --dry-run` as its final step and the operator applies with the real sync command.",
+  "jobs": [
+    {
+      "name": "kanban needs input watcher",
+      "schedule": "every 5m",
+      "no_agent": true,
+      "script": "needs-input-watcher.py",
+      "deliver": "local"
+    },
+    {
+      "name": "kanban stale block watch",
+      "schedule": "every 10m",
+      "no_agent": true,
+      "script": "stale-block-watch.py",
+      "deliver": "local"
+    },
+    {
+      "name": "kanban review gap watchdog",
+      "schedule": "every 10m",
+      "no_agent": true,
+      "script": "review-gap.py",
+      "deliver": "local"
+    },
+    {
+      "name": "hkrc archloop nightly",
+      "schedule": "30 0 * * *",
+      "no_agent": true,
+      "script": "archloop-night-cron.sh",
+      "deliver": "local"
+    },
+    {
+      "name": "harness-learning-loop (daily 7-day self-review)",
+      "schedule": "0 3 * * *",
+      "no_agent": true,
+      "script": "harness-loop.py",
+      "deliver": "local"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": "hkrc.outcome-guard-assets.v1",
+  "description": "Checked asset manifest for the HKRC Outcome Guard Gate 2 package. A release install fails when any required file is missing, so a broken package can never be shipped.",
+  "required": [
+    "src/hkrc/outcome_guard.py",
+    "src/hkrc/admission.py",
+    "src/hkrc/git_enforce.py",
+    "src/hkrc/state.py",
+    "src/hkrc/config.py",
+    "src/hkrc/cli.py",
+    "config/hkrc/outcome-guard-assets.json",
+    "config/hkrc/outcome-guard-example-contract.json",
+    "docs/outcome-guard.md",
+    "systemd/hkrc.service.in",
+    "skills/hermes-kanban-blocker-recovery/SKILL.md"
+  ]
+}
