@@ -89,6 +89,34 @@ section.
 - Python 3.11+, uv; a running Hermes instance with Kanban boards.
 - Cron for the watchdog cadence; systemd optional, always opt-in.
 
+## Decision-latency watcher (`watcher`)
+
+The `watcher` command closes the four decision-latency stalls measured in daily
+operation: defect-blocked reviews waiting on a fix card, supersede bookkeeping,
+the one-at-a-time pick gate, and blocked-on-creation tasks. It auto-creates fix
+cards from reviewer defect blocks (idempotent per review + block episode) and,
+when a fix is verified merged into the canonical branch (`git merge-base
+--is-ancestor`, never a claimed SHA), completes the original review and
+promotes any gated children.
+
+## Harness learning loop (`harness-loop`)
+
+A nightly 7-day self-review of the instance's own sessions, distilled into
+classified defects and a graded improvement digest. `hkrc harness-loop run
+--config <config.toml>` (ports the legacy `f69651252ba1` cron job). Start with
+`--dry-run`: the loop writes its plan and escalations without dispatching until
+you flip it on. The verbatim prompt lives in
+[references/harness-loop-prompt.md](references/harness-loop-prompt.md).
+
+## Deep dives
+
+- [Decision-latency watcher (`watcher`)](references/orchestrator-escalation-rule.md) — why stalled
+  decisions get escalated, and how the watchdog cadence is computed.
+- [Harness learning loop (`harness-loop`)](references/harness-loop-prompt.md) — the nightly
+  self-review loop prompt and escalation rule.
+- [Persona matrix (`persona_matrix`)](references/persona-matrix.md) and its operational
+  [runbook](docs/persona-matrix-runbook.md) — role/persona drift detection and evidence.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
