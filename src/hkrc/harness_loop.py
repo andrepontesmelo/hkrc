@@ -310,6 +310,11 @@ class HarnessLoopConfig:
     # router and an analyzer failure/timeout routes zero tickets.
     analysis_profile: str = ""
     analysis_timeout_seconds: int = 120
+    # Transient-failure resilience: a failed or malformed analyzer attempt
+    # is retried up to this many attempts (short backoff between tries)
+    # before the stage fails closed with zero tickets.  One flaky LLM call
+    # no longer holds the nightly ticket routing hostage.
+    analysis_max_attempts: int = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -360,6 +365,14 @@ class HarnessLoopConfig:
         ):
             raise HarnessLoopError(
                 "harness_loop analysis_timeout_seconds must be a positive integer"
+            )
+        if (
+            not isinstance(self.analysis_max_attempts, int)
+            or isinstance(self.analysis_max_attempts, bool)
+            or self.analysis_max_attempts <= 0
+        ):
+            raise HarnessLoopError(
+                "harness_loop analysis_max_attempts must be a positive integer"
             )
 
 
@@ -3150,12 +3163,15 @@ def _invoke_analyzer(
     prompt: str,
     *,
     runner: ProcessRunner | None = None,
-) -> str | None:
-    """Invoke the analyzer once; return valid stdout or ``None``.
+) -> tuple[str, str | None, str]:
+    """Invoke the analyzer once; return ``(kind, stdout, stderr)``.
 
-    ``None`` covers timeout, nonzero exit, spawn failure, empty output, and
-    CLI-chrome-laden output — the caller treats any of these as a failed
-    analysis and routes zero tickets.
+    ``kind`` classifies the attempt for the retry loop and the failure
+    report: ``"ok"`` (stdout carries the model reply), ``"timeout"``
+    (the subprocess hit ``analysis_timeout_seconds``), ``"exit"`` (spawn
+    failure or nonzero exit), or ``"malformed"`` (empty or CLI-chrome-laden
+    stdout).  ``stdout`` is non-``None`` only for ``"ok"``; ``stderr``
+    carries whatever the attempt captured (empty when nothing was).
     """
     command = _analyzer_command(config, prompt)
     timeout = int(config.harness_loop.analysis_timeout_seconds)
@@ -3174,33 +3190,75 @@ def _invoke_analyzer(
             result = ProcessResult(
                 completed.returncode, completed.stdout, completed.stderr
             )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
+    except subprocess.TimeoutExpired as exc:
+        return "timeout", None, str(exc)
+    except OSError as exc:
+        return "exit", None, str(exc)
+    stderr = result.stderr or ""
     if result.returncode != 0:
-        return None
+        return "exit", None, stderr
     output = (result.stdout or "").strip()
-    if not output:
+    if not output or any(marker in output for marker in _ANALYSIS_OUTPUT_CHROME):
+        return "malformed", None, stderr
+    return "ok", output, stderr
+
+
+def _first_json_object(text: str) -> str | None:
+    """Slice the first balanced ``{...}`` block (string-aware) or ``None``.
+
+    Tracks JSON string literals and backslash escapes so braces inside
+    strings never unbalance the scan; an unterminated object returns
+    ``None`` (fail closed).
+    """
+    start = text.find("{")
+    if start < 0:
         return None
-    if any(marker in output for marker in _ANALYSIS_OUTPUT_CHROME):
-        return None
-    return output
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
 
 
 def _parse_analysis_json(output: str) -> dict | None:
-    """Parse the analyzer's JSON reply; tolerate one markdown-fence wrapper.
+    """Parse the analyzer's JSON reply; tolerate prose or fence wrappers.
 
-    Anything beyond a fenced or bare JSON object (prose, arrays, null) is
-    malformed and rejected by the caller.
+    A bare object, one markdown-fence wrapper, or prose surrounding the
+    first JSON object all parse; non-JSON garbage (no balanced object, an
+    unparseable one, or any non-dict JSON) is rejected by the caller.
     """
     text = output.strip()
     match = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
         text = match.group(1).strip()
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    candidates = [text]
+    block = _first_json_object(text)
+    if block is not None and block != text:
+        candidates.append(block)
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        return parsed if isinstance(parsed, dict) else None
+    return None
 
 
 def _merge_severity(findings: Sequence[Finding]) -> str:
@@ -3383,6 +3441,32 @@ def _validate_proposal(
     return "route", finding, ""
 
 
+ANALYZER_FAILURE_FILENAME = "analyzer-last-failure.txt"
+_ANALYSIS_RETRY_BACKOFF_SECONDS = 30.0
+_ANALYZER_DUMP_MAX_CHARS = 20_000
+
+
+def analyzer_failure_path(state_db: Path) -> Path:
+    """Path of the raw analyzer failure dump (next to the state database)."""
+    return Path(state_db).parent / ANALYZER_FAILURE_FILENAME
+
+
+def _persist_analyzer_failure(path: Path, attempts: Sequence[str]) -> None:
+    """Write the bounded per-attempt failure dump; best effort, never raises.
+
+    The dump is the post-mortem artifact for "analysis failed (zero
+    tickets)" reports: raw stdout/stderr per attempt with the failure kind
+    and duration, so a malformed reply is diagnosable after the fact.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "\n\n".join(attempts)[-_ANALYZER_DUMP_MAX_CHARS:], encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
 def analyze_candidates(
     evidence: Sequence[Finding],
     config: "ControllerConfig",
@@ -3392,6 +3476,7 @@ def analyze_candidates(
     cooldown_seconds: int = 30 * 86400,
     suggested_fingerprints: Sequence[dict] = (),
     runner: ProcessRunner | None = None,
+    backoff_seconds: float = _ANALYSIS_RETRY_BACKOFF_SECONDS,
 ) -> AnalysisResult:
     """Run the authoritative analysis stage; never raises on analyzer failure.
 
@@ -3404,9 +3489,11 @@ def analyze_candidates(
 
     Failure semantics (no-agent cron reliability): when no analysis profile
     is configured the stage is ``"disabled"`` and the caller preserves the
-    deterministic routing behavior; when the analyzer fails, times out, or
-    returns malformed output the stage is ``"failed"`` and the caller
-    routes zero tickets — never a partial apply.
+    deterministic routing behavior; a failed, timed-out, or malformed
+    attempt is retried up to ``analysis_max_attempts`` (short backoff
+    between tries, raw output persisted next to the state database), and
+    only after the final failed attempt the stage is ``"failed"`` — the
+    caller routes zero tickets, never a partial apply.
     """
     profile = config.harness_loop.analysis_profile
     if not profile:
@@ -3416,24 +3503,43 @@ def analyze_candidates(
         return AnalysisResult(status="ok", notes=("no findings to analyze",))
     document = serialize_evidence(findings, now=now, window_hours=window_hours)
     repo = Path(config.harness_loop.hkrc_repo or DEFAULT_HKRC_REPO)
-    output = _invoke_analyzer(
-        config, build_analysis_prompt(document, hkrc_repo=repo), runner=runner
-    )
-    if output is None:
-        return AnalysisResult(
-            status="failed",
-            reason=(
-                f"authoritative analysis failed (profile={profile}); "
-                "zero tickets this run"
-            ),
+    prompt = build_analysis_prompt(document, hkrc_repo=repo)
+    # Transient-failure resilience: a failed (timeout/exit) or malformed
+    # attempt is retried up to ``analysis_max_attempts`` with a short
+    # backoff; only the FINAL failure fails closed, and the raw per-attempt
+    # output is persisted next to the state database so the zero-ticket
+    # report is diagnosable post-mortem.
+    max_attempts = max(1, int(config.harness_loop.analysis_max_attempts))
+    attempt_log: list[str] = []
+    last_kind = "exit"
+    parsed: dict | None = None
+    for attempt in range(1, max_attempts + 1):
+        started = time.monotonic()
+        kind, output, stderr = _invoke_analyzer(config, prompt, runner=runner)
+        duration = time.monotonic() - started
+        if kind == "ok":
+            assert output is not None
+            parsed = _parse_analysis_json(output)
+            if parsed is not None:
+                break
+            kind = "malformed"
+        last_kind = kind
+        attempt_log.append(
+            f"attempt {attempt}/{max_attempts}: {kind} after {duration:.1f}s\n"
+            f"--- stdout ---\n{(output or '')[:_ANALYZER_DUMP_MAX_CHARS]}\n"
+            f"--- stderr ---\n{(stderr or '')[:_ANALYZER_DUMP_MAX_CHARS]}"
         )
-    parsed = _parse_analysis_json(output)
+        if attempt < max_attempts:
+            time.sleep(backoff_seconds)
     if parsed is None:
+        dump_path = analyzer_failure_path(config.state_db)
+        _persist_analyzer_failure(dump_path, attempt_log)
         return AnalysisResult(
             status="failed",
             reason=(
-                "authoritative analysis returned malformed output; "
-                "zero tickets this run"
+                f"authoritative analysis failed after {max_attempts} attempt(s) "
+                f"(last: {last_kind}, profile={profile}); "
+                f"raw output: {dump_path}; zero tickets this run"
             ),
         )
     proposals = parsed.get("proposals")

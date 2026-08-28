@@ -583,6 +583,7 @@ class ControllerConfig:
             f"hkrc_repo = {_toml_optional_string(str(self.harness_loop.hkrc_repo) if self.harness_loop.hkrc_repo else None)}\n"
             f"analysis_profile = {_toml_string(self.harness_loop.analysis_profile)}  # empty = authoritative analysis disabled\n"
             f"analysis_timeout_seconds = {self.harness_loop.analysis_timeout_seconds}\n"
+            f"analysis_max_attempts = {self.harness_loop.analysis_max_attempts}\n"
             "\n[assist]\n"
             f"human_in_loop = {'true' if self.assist.human_in_loop else 'false'}\n"
             "\n[outcome_guard]\n"
@@ -800,6 +801,7 @@ def load_config(path: Path) -> ControllerConfig:
     harness_loop_hkrc_repo = harness_loop.get("hkrc_repo")
     harness_loop_analysis_profile = harness_loop.get("analysis_profile", "")
     harness_loop_analysis_timeout = harness_loop.get("analysis_timeout_seconds", 120)
+    harness_loop_analysis_max_attempts = harness_loop.get("analysis_max_attempts", 2)
     assist_human_in_loop = assist.get("human_in_loop", True)
     if not isinstance(assist_human_in_loop, bool):
         raise ConfigError("assist human_in_loop must be a boolean")
@@ -846,6 +848,12 @@ def load_config(path: Path) -> ControllerConfig:
         or harness_loop_analysis_timeout <= 0
     ):
         raise ConfigError("harness_loop analysis_timeout_seconds must be a positive integer")
+    if (
+        not isinstance(harness_loop_analysis_max_attempts, int)
+        or isinstance(harness_loop_analysis_max_attempts, bool)
+        or harness_loop_analysis_max_attempts <= 0
+    ):
+        raise ConfigError("harness_loop analysis_max_attempts must be a positive integer")
     outcome_guard_protected_refs = outcome_guard.get(
         "protected_refs", ["refs/heads/main"]
     )
@@ -940,6 +948,7 @@ def load_config(path: Path) -> ControllerConfig:
             ),
             analysis_profile=harness_loop_analysis_profile,
             analysis_timeout_seconds=harness_loop_analysis_timeout,
+            analysis_max_attempts=harness_loop_analysis_max_attempts,
         ),
         assist=AssistConfig(human_in_loop=assist_human_in_loop),
         outcome_guard=OutcomeGuardConfig(

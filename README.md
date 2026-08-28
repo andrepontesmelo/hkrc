@@ -70,8 +70,8 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). Zero runtime third-p
 dependencies.
 
 ```bash
-git clone https://github.com/andrepontesmelo/hermes-kanban-recovery-controller
-cd hermes-kanban-recovery-controller
+git clone https://github.com/andrepontesmelo/hkrc
+cd hkrc
 uv sync --dev
 uv run pytest                       # full suite green
 

@@ -28,6 +28,7 @@ from hkrc.harness_loop import (
     _apply_candidates,
     _next_action,
     _open_board_snapshot,
+    _parse_analysis_json,
     analyze_candidates,
     apply_policy_gate,
     build_analysis_prompt,
@@ -277,6 +278,7 @@ def make_config(
     reviewer_profiles: tuple[str, ...] = (),
     analysis_profile: str = "",
     analysis_timeout_seconds: int = 120,
+    analysis_max_attempts: int = 2,
 ) -> ControllerConfig:
     profiles = tmp_path / "profiles"
     return ControllerConfig(
@@ -293,6 +295,7 @@ def make_config(
             hkrc_repo=hkrc_repo or (tmp_path / "repo"),
             analysis_profile=analysis_profile,
             analysis_timeout_seconds=analysis_timeout_seconds,
+            analysis_max_attempts=analysis_max_attempts,
         ),
         watcher=WatcherConfig(reviewer_profiles=reviewer_profiles),
     )
@@ -2452,6 +2455,7 @@ def test_analysis_timeout_routes_zero_tickets(tmp_path: Path) -> None:
         sessions_db=sessions_db,
         hkrc_repo=repo,
         analysis_profile="nightly-analysis",
+        analysis_max_attempts=1,
     )
     state_file = tmp_path / "state" / "hkrc" / "harness-loop-state.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2493,26 +2497,175 @@ def test_analysis_timeout_routes_zero_tickets(tmp_path: Path) -> None:
 
 
 def test_analysis_malformed_json_routes_zero_tickets(tmp_path: Path) -> None:
-    """AC3/AC5: malformed analyzer output fails closed with zero tickets."""
+    """AC3/AC5: malformed analyzer output fails closed with zero tickets.
+
+    With the default ``analysis_max_attempts = 2`` the malformed reply is
+    retried once before failing closed — both attempts land, zero tickets.
+    """
     repo, evidence_row, _fp = analysis_evidence(tmp_path)
     config = make_config(tmp_path, hkrc_repo=repo, analysis_profile="nightly-analysis")
     runner, analyzer_calls, _ticket_calls = make_analysis_runner(
         stdout="definitely not json {{{"
     )
     result = analyze_candidates(
-        [evidence_row], config, now=NOW, window_hours=24, runner=runner
+        [evidence_row],
+        config,
+        now=NOW,
+        window_hours=24,
+        runner=runner,
+        backoff_seconds=0.0,
     )
-    assert len(analyzer_calls) == 1
+    assert len(analyzer_calls) == 2  # malformed attempt retried, then failed
     assert result.status == "failed"
     assert "malformed" in result.reason
     assert result.proposals == ()
     # Prose output (a dict-less reply) is equally malformed.
     runner2, _calls2, _tc2 = make_analysis_runner(stdout="I analysed the findings.")
     result2 = analyze_candidates(
-        [evidence_row], config, now=NOW, window_hours=24, runner=runner2
+        [evidence_row],
+        config,
+        now=NOW,
+        window_hours=24,
+        runner=runner2,
+        backoff_seconds=0.0,
     )
     assert result2.status == "failed"
     assert result2.proposals == ()
+
+
+@pytest.mark.parametrize("first_kind", ["timeout", "malformed"])
+def test_analysis_retry_fail_then_succeed_routes_tickets(
+    tmp_path: Path, first_kind: str
+) -> None:
+    """AC: one transient failure is retried; the good attempt routes tickets."""
+    repo, evidence_row, fp = analysis_evidence(tmp_path)
+    config = make_config(tmp_path, hkrc_repo=repo, analysis_profile="nightly-analysis")
+    proposal = valid_analysis_proposal(fp)
+    first: ProcessResult | Exception
+    if first_kind == "timeout":
+        first = subprocess.TimeoutExpired(cmd=[], timeout=120)
+    else:
+        first = ProcessResult(0, "definitely not json {{{", "")
+    outcomes = iter(
+        [first, ProcessResult(0, json.dumps({"proposals": [proposal]}), "")]
+    )
+    calls: list[str] = []
+
+    def runner(
+        argv: Sequence[str], env: Mapping[str, str], timeout_secs: int
+    ) -> ProcessResult:
+        calls.append(" ".join(argv))
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    result = analyze_candidates(
+        [evidence_row],
+        config,
+        now=NOW,
+        window_hours=24,
+        runner=runner,
+        backoff_seconds=0.0,
+    )
+    assert len(calls) == 2  # failed attempt, then the retry
+    assert result.status == "ok"
+    assert len(result.proposals) == 1
+    assert result.proposals[0].key == "t_a"
+
+
+def test_analysis_retries_exhausted_fails_closed_with_dump(tmp_path: Path) -> None:
+    """AC: retries exhausted -> zero tickets, reason names attempts and dump."""
+    repo, evidence_row, _fp = analysis_evidence(tmp_path)
+    config = make_config(tmp_path, hkrc_repo=repo, analysis_profile="nightly-analysis")
+    runner, analyzer_calls, _ticket_calls = make_analysis_runner(
+        stdout="garbage {{{ nope"
+    )
+    result = analyze_candidates(
+        [evidence_row],
+        config,
+        now=NOW,
+        window_hours=24,
+        runner=runner,
+        backoff_seconds=0.0,
+    )
+    assert len(analyzer_calls) == 2  # default analysis_max_attempts exhausted
+    assert result.status == "failed"
+    assert result.proposals == ()
+    assert "failed after 2 attempt(s)" in result.reason
+    assert "(last: malformed" in result.reason
+    dump = tmp_path / "state" / "hkrc" / "analyzer-last-failure.txt"
+    assert str(dump) in result.reason  # the dump path is named in the reason
+    text = dump.read_text(encoding="utf-8")
+    assert "attempt 1/2: malformed" in text
+    assert "attempt 2/2: malformed" in text
+    assert "garbage {{{ nope" in text  # raw stdout persisted for post-mortem
+
+
+def test_analysis_timeout_failure_persists_dump(tmp_path: Path) -> None:
+    """AC: a timeout failure dumps the attempt and names the kind."""
+    repo, evidence_row, _fp = analysis_evidence(tmp_path)
+    config = make_config(
+        tmp_path,
+        hkrc_repo=repo,
+        analysis_profile="nightly-analysis",
+        analysis_max_attempts=1,
+    )
+    runner, analyzer_calls, _ticket_calls = make_analysis_runner(timeout=True)
+    result = analyze_candidates(
+        [evidence_row],
+        config,
+        now=NOW,
+        window_hours=24,
+        runner=runner,
+        backoff_seconds=0.0,
+    )
+    assert len(analyzer_calls) == 1
+    assert result.status == "failed"
+    assert "(last: timeout" in result.reason
+    dump = tmp_path / "state" / "hkrc" / "analyzer-last-failure.txt"
+    assert "attempt 1/1: timeout" in dump.read_text(encoding="utf-8")
+
+
+def test_analysis_prose_wrapped_json_parses_without_retry(tmp_path: Path) -> None:
+    """AC: prose around the JSON reply no longer fails the analysis."""
+    repo, evidence_row, fp = analysis_evidence(tmp_path)
+    config = make_config(tmp_path, hkrc_repo=repo, analysis_profile="nightly-analysis")
+    wrapped = (
+        "Here is my analysis:\n"
+        + json.dumps({"proposals": [valid_analysis_proposal(fp)]})
+        + "\nHope this helps!"
+    )
+    runner, analyzer_calls, _ticket_calls = make_analysis_runner(stdout=wrapped)
+    result = analyze_candidates(
+        [evidence_row], config, now=NOW, window_hours=24, runner=runner
+    )
+    assert len(analyzer_calls) == 1  # parsed on the first attempt, no retry
+    assert result.status == "ok"
+    assert len(result.proposals) == 1
+
+
+def test_parse_analysis_json_tolerates_prose_wrapped_object() -> None:
+    """AC: balanced-brace extraction handles prose and partial fences."""
+    assert _parse_analysis_json('prose {"proposals": []} more prose') == {
+        "proposals": []
+    }
+    assert _parse_analysis_json('```json\nnotes {"proposals": []}\n```') == {
+        "proposals": []
+    }
+    assert _parse_analysis_json('{"a": "} brace in string"}') == {
+        "a": "} brace in string"
+    }
+    assert _parse_analysis_json('{"a": 1}') == {"a": 1}
+    assert _parse_analysis_json('```json\n{"a": 1}\n```') == {"a": 1}
+
+
+def test_parse_analysis_json_still_rejects_garbage() -> None:
+    """AC: non-JSON garbage and non-dict JSON stay fail-closed."""
+    assert _parse_analysis_json("definitely not json {{{") is None
+    assert _parse_analysis_json("I analysed the findings.") is None
+    assert _parse_analysis_json('{"unbalanced": ') is None
+    assert _parse_analysis_json('["array"]') is None
 
 
 def test_analysis_disabled_preserves_deterministic_routing(tmp_path: Path) -> None:

@@ -403,6 +403,47 @@ def test_controller_config_rejects_non_positive_threshold_directly(tmp_path: Pat
         )
 
 
+def test_harness_loop_analysis_max_attempts_round_trips(tmp_path: Path) -> None:
+    config = ControllerConfig(
+        instance_name="work-a",
+        native_boards_root=tmp_path / "native-boards",
+        state_db=tmp_path / "controller.sqlite3",
+    )
+    path = tmp_path / "config.toml"
+    write_config(path, config)
+
+    assert "analysis_max_attempts = 2" in path.read_text()
+    assert load_config(path) == config
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    ["analysis_max_attempts = 0", 'analysis_max_attempts = "two"'],
+)
+def test_harness_loop_config_rejects_bad_analysis_max_attempts(
+    tmp_path: Path, fragment: str
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f"""format_version = 1
+
+[instance]
+name = "work-a"
+native_boards_root = "/tmp/hermes/kanban/boards"
+
+[controller]
+state_db = "/tmp/hermes/state/hkrc/state.sqlite3"
+
+[harness_loop]
+{fragment}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="analysis_max_attempts"):
+        load_config(path)
+
+
 @pytest.mark.parametrize(
     "fragment",
     ["recency_window_seconds = 0", "recency_window_seconds = -5", 'recency_window_seconds = "sixty"'],
