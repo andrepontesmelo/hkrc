@@ -32,6 +32,7 @@ from .persona_matrix import (
     MODEL_FLASH,
     MODEL_LUNA_HIGH,
     MODEL_PRO,
+    PRO_MODEL_IDS,
     STATUS_ELIMINATED,
     persona_spec,
 )
@@ -150,7 +151,7 @@ def check_snapshot(snapshot: ProfileSnapshot) -> list[DriftFinding]:
     for override_model, level in snapshot.reasoning_overrides:
         if (
             snapshot.persona == "authoritative"
-            and (override_model, level) == AUTHORITATIVE_ALLOWED_OVERRIDE
+            and (override_model, level) in AUTHORITATIVE_ALLOWED_OVERRIDE
         ):
             continue
         findings.append(
@@ -286,10 +287,14 @@ def _model_tier(model_id: str | None) -> str | None:
 
     The matrix is expressed in tiers (t_49ba1035: developer = flash, senior
     dev = pro; frontend-dev = luna-high, t_545a638a); live configs carry
-    full ids such as ``opencode-go/deepseek-v4-flash``, ``zai/glm-5.3`` or
-    ``cx/gpt-5.6-luna-high``. An id naming neither tier nor the explicit
-    pro id is unrecognized and therefore drift — the matrix allows flash,
-    pro, or luna-high only.
+    full ids such as ``opencode-go/deepseek-v4-flash``, ``glm-5.3``,
+    ``zai/glm-5.3``, ``virtual/glm-5.3`` or ``cx/gpt-5.6-luna-high``.
+    Flash wins first, so a ``-flash`` id never falls through to the pro
+    set (t_a832a269: ``glm-5.3-flash`` stays flash). A GLM pro id is
+    recognized in its bare direct-zai, legacy ``zai/``-prefixed, and
+    OmniRoute ``virtual/``-prefixed forms (PRO_MODEL_IDS); any other id
+    naming neither tier nor the pro set is unrecognized and therefore
+    drift — the matrix allows flash, pro, or luna-high only.
     """
     if model_id is None:
         return None
@@ -300,7 +305,7 @@ def _model_tier(model_id: str | None) -> str | None:
         return MODEL_PRO
     if MODEL_LUNA_HIGH in lowered:
         return MODEL_LUNA_HIGH
-    if lowered == "zai/glm-5.3":
+    if lowered in PRO_MODEL_IDS:
         return MODEL_PRO
     return None
 

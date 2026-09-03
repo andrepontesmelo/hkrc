@@ -122,10 +122,48 @@ def _default_external_dirs() -> tuple[str, ...]:
 
 DEFAULT_EXTERNAL_DIRS = _default_external_dirs()
 DEFAULT_HKRC_REPO = str(Path("~/git/hermes-kanban-recovery-controller").expanduser())
+# Worker-profile skill resolution ground truth (re-verified 2026-08-31,
+# task t_3de7f74e): worker profiles resolve force-loaded skills ONLY through
+# ``skills.external_dirs`` -> the dist root.  The global ``~/.hermes/skills``
+# pool and profile-private skills dirs are NOT consulted — a skill living in
+# a profile-private dir resolves for NOBODY, not even that profile.
+DEFAULT_DIST_SKILLS_ROOT = "/home/example-user/.hermes/dist-skills"
+# Profiles root for the assignee-profile existence sweep (config_drift +
+# skill-pin detectors).  Resolved from config/env ONLY — never derived from
+# the sessions database path (the DB may sit at ``~/.hermes/state.db`` with
+# no ``main/`` segment, which sent the old ``parent.parent`` derivation to
+# the home directory: 10 nightly false positives, t_ae960b7d) and never via
+# ``Path.home()`` (profile-redirected inside a Hermes worker session,
+# 2026-08-15 pitfall).  Same instance-specific literal pattern as
+# DEFAULT_DIST_SKILLS_ROOT above.
+DEFAULT_PROFILES_ROOT = "/home/example-user/.hermes/profiles"
+# Archloop nightly cron report root for the skip-streak sweep.  Resolved
+# config -> env -> this explicit instance literal (same pattern as
+# DEFAULT_PROFILES_ROOT above) — never derived from $HOME or a sessions-db
+# path (t_ae960b7d: a derived root silently resolved to $HOME and
+# produced 10 false HIGHs a night).  A missing/unreadable path yields zero
+# findings, never an exception (fail-safe, t_ba4092e4).
+DEFAULT_ARCHLOOP_OUTPUT_DIR = "/home/example-user/.hermes/cron/output"
+# Skip classes the sweep treats as operator-fixable (config-overridable).
+# Only "dirty" is actionable by default (orchestrator correction 2026-09-01):
+# being off main is the NORMAL permanent state of a feature worktree
+# (rentcli-wt-realtorca — a 17-report-night not-on-main streak is not
+# neglect).  "no-new-commits" / "board-archived" are never actionable.
+ACTIONABLE_SKIP_CLASSES: tuple[str, ...] = ("dirty",)
+# Streak thresholds in consecutive report nights.  A "night" is ONE REPORT
+# FILE: streaks count consecutive reports, never calendar days — a cron
+# outage (9 nights missing from the live 2026-08 archive) must not inflate
+# a neglect streak (orchestrator correction 2026-09-01).
+ARCHLOOP_MEDIUM_NIGHTS = 3
+ARCHLOOP_HIGH_NIGHTS = 7
 
 REVIEW_REQUIRED_PREFIX = "review-required:"
 DENSITY_THRESHOLD_PER_MSG = 100_000
 DECISION_LATENCY_SECONDS = 1800
+# Human-gated (needs_input) blocks wait on Andre, not on a worker: no
+# automation can clear them, so the 30-minute machine threshold would fire
+# forever.  A decision genuinely rotting for weeks IS worth surfacing.
+DECISION_LATENCY_HUMAN_SECONDS = 7 * 86400
 OUTAGE_LATENCY_SECONDS = 5 * 3600
 FIX_CHAIN_THRESHOLD = 4
 CURATOR_LOOKBACK_DAYS = 7
@@ -176,7 +214,21 @@ _TASK_ID_PATTERN = re.compile(r"t_[0-9a-f]{8}")
 # the ``trigger_outcome`` (spawn_failed | crashed | timed_out) that spent
 # the budget.  This is the deterministic retry-exhaustion signal.
 GAVE_UP_KIND = "gave_up"
+# Terminal task statuses.  Mirrors the collector's open-task SQL filter in
+# _collect_one_board (``status NOT IN ('done', 'cancelled', 'archived')``);
+# defined once here so detect_retry_exhaustion consults card currency
+# against the exact set the collector treats as non-open.
+_TERMINAL_TASK_STATUSES = frozenset({"done", "cancelled", "archived"})
 RETRY_EXHAUSTION_PATTERN = "retry-exhaustion"
+# t_3de7f74e: pre-dispatch pin-resolution sweep.  Two finding kinds in one
+# detector — an unresolvable pinned skill (spawn-time hard crash when every
+# pin is missing: Hermes core raises ValueError("Unknown skill(s): ...") only
+# when NOTHING loaded, cli.py:8776; partial misses degrade gracefully,
+# cli.py:8760-8776) and an assignee whose worker profile directory does not
+# exist at all (such a card can never dispatch either).
+SKILL_UNRESOLVABLE_PATTERN = "skill-unresolvable"
+ARCHLOOP_SKIP_STREAK_PATTERN = "archloop-skip-streak"
+ASSIGNEE_NO_PROFILE_PATTERN = "assignee-no-profile"
 _BLOCKED_FAILURE_KINDS = frozenset(
     {
         "blocked",
@@ -302,6 +354,15 @@ class HarnessLoopConfig:
     bloat_top_n: int = 3
     sessions_db: Path | None = None
     external_dirs: tuple[str, ...] = ()
+    # Dist root worker profiles resolve force-loaded skills from (the
+    # ``skills.external_dirs`` target).  Read-only input for the
+    # skill-unresolvable pin sweep; a missing dir emits no findings.
+    dist_skills_root: str = DEFAULT_DIST_SKILLS_ROOT
+    # Profiles root sweep input.  Empty string = auto: HKRC_PROFILES_ROOT
+    # env (parity with persona_drift), else DEFAULT_PROFILES_ROOT.  Kept a
+    # plain string so the round-trip stays stable; an explicit value wins
+    # over the env so a pinned config cannot be silently redirected.
+    profiles_root: str = ""
     hkrc_repo: Path | None = None
     # Authoritative analysis stage: a Hermes profile invoked between
     # deterministic evidence collection and the ticket router.  Empty
@@ -315,6 +376,47 @@ class HarnessLoopConfig:
     # before the stage fails closed with zero tickets.  One flaky LLM call
     # no longer holds the nightly ticket routing hostage.
     analysis_max_attempts: int = 2
+    # Finding escalation ladder (render-time only): an open/deferred queue
+    # entry recurring on >= ``escalate_after_nights`` nights renders one
+    # severity step louder; >= ``chronic_after_nights`` renders HIGH and
+    # carries the CHRONIC tag.  Both are derived at render time — the stored
+    # severity (the detector's verdict, feeding dedupe/audit) is never
+    # rewritten and ``apply_kind`` is untouched (report-only stays
+    # report-only: HKRC proposes, the human decides).
+    escalate_after_nights: int = 7
+    chronic_after_nights: int = 21
+    # Ledger retention: ``stale`` queue entries whose ``last_seen`` is older
+    # than this many days are pruned (behind a one-time timestamped backup)
+    # before the state file is persisted.  Never prunes ``open``,
+    # ``deferred``, or ``resolved``.  The 14d default is measured against the
+    # live ledger: recurrence refreshes ``last_seen``, so a 30d window would
+    # prune zero rows forever (a silent no-op); 14d prunes 126 of 210.
+    stale_retention_days: int = 14
+    # Archloop nightly cron report root (skip-streak sweep input).  Empty
+    # string = HKRC_ARCHLOOP_OUTPUT_DIR env, else DEFAULT_ARCHLOOP_OUTPUT_DIR
+    # (live root; sweep enabled — same fallback chain as profiles_root), and
+    # a missing/empty dir yields zero findings.  Never derived from $HOME or
+    # the sessions-db path.
+    archloop_output_dir: str = DEFAULT_ARCHLOOP_OUTPUT_DIR
+    # Skip classes that escalate to a finding (operator-fixable).  Default:
+    # only "dirty" — not-on-main is the normal state of a feature worktree.
+    archloop_actionable_classes: tuple[str, ...] = ACTIONABLE_SKIP_CLASSES
+    # Streak thresholds in consecutive report nights (a night = one report
+    # file; cron outages never inflate a streak).
+    archloop_medium_nights: int = ARCHLOOP_MEDIUM_NIGHTS
+    archloop_high_nights: int = ARCHLOOP_HIGH_NIGHTS
+    # Deliberate per-profile ``model.default`` pins for the config-drift
+    # detector (t_48fcf459).  A profile listed here stops being flagged as
+    # drift; every UNDECLARED divergence is still flagged.  Empty (default)
+    # = flag all divergence exactly as before — a deliberate pin must be
+    # declared in config.toml, never hardcoded.
+    config_drift_allowed_profiles: tuple[str, ...] = ()
+    # Decision-latency thresholds.  Machine-blocked cards (worker stuck,
+    # guard, dependency) are defects after this many seconds.  Human-gated
+    # (needs_input) cards wait on the operator and can legitimately wait
+    # days, so they use decision_latency_human_seconds instead.
+    decision_latency_seconds: int | float = DECISION_LATENCY_SECONDS
+    decision_latency_human_seconds: int | float = DECISION_LATENCY_HUMAN_SECONDS
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -354,6 +456,10 @@ class HarnessLoopConfig:
             )
         if len(set(self.external_dirs)) != len(self.external_dirs):
             raise HarnessLoopError("harness_loop external_dirs must not contain duplicates")
+        if not isinstance(self.dist_skills_root, str) or not self.dist_skills_root.strip():
+            raise HarnessLoopError("harness_loop dist_skills_root must be a non-empty string")
+        if not isinstance(self.profiles_root, str):
+            raise HarnessLoopError("harness_loop profiles_root must be a string or empty")
         if self.hkrc_repo is not None and not isinstance(self.hkrc_repo, Path):
             raise HarnessLoopError("harness_loop hkrc_repo must be a path or null")
         if not isinstance(self.analysis_profile, str):
@@ -373,6 +479,91 @@ class HarnessLoopConfig:
         ):
             raise HarnessLoopError(
                 "harness_loop analysis_max_attempts must be a positive integer"
+            )
+        if (
+            not isinstance(self.escalate_after_nights, int)
+            or isinstance(self.escalate_after_nights, bool)
+            or self.escalate_after_nights <= 0
+        ):
+            raise HarnessLoopError(
+                "harness_loop escalate_after_nights must be a positive integer"
+            )
+        if (
+            not isinstance(self.chronic_after_nights, int)
+            or isinstance(self.chronic_after_nights, bool)
+            or self.chronic_after_nights <= 0
+        ):
+            raise HarnessLoopError(
+                "harness_loop chronic_after_nights must be a positive integer"
+            )
+        if self.chronic_after_nights < self.escalate_after_nights:
+            raise HarnessLoopError(
+                "harness_loop chronic_after_nights must be >= escalate_after_nights"
+            )
+        if (
+            not isinstance(self.stale_retention_days, int)
+            or isinstance(self.stale_retention_days, bool)
+            or self.stale_retention_days <= 0
+        ):
+            raise HarnessLoopError(
+                "harness_loop stale_retention_days must be a positive integer"
+            )
+        if not isinstance(self.archloop_output_dir, str):
+            raise HarnessLoopError(
+                "harness_loop archloop_output_dir must be a string or empty"
+            )
+        if not isinstance(self.archloop_actionable_classes, tuple) or any(
+            not isinstance(archive_class, str) or not archive_class.strip()
+            for archive_class in self.archloop_actionable_classes
+        ):
+            raise HarnessLoopError(
+                "harness_loop archloop_actionable_classes must be a tuple "
+                "of non-empty strings"
+            )
+        if len(set(self.archloop_actionable_classes)) != len(
+            self.archloop_actionable_classes
+        ):
+            raise HarnessLoopError(
+                "harness_loop archloop_actionable_classes must not contain duplicates"
+            )
+        if (
+            not isinstance(self.archloop_medium_nights, int)
+            or isinstance(self.archloop_medium_nights, bool)
+            or self.archloop_medium_nights <= 0
+        ):
+            raise HarnessLoopError(
+                "harness_loop archloop_medium_nights must be a positive integer"
+            )
+        if (
+            not isinstance(self.archloop_high_nights, int)
+            or isinstance(self.archloop_high_nights, bool)
+            or self.archloop_high_nights < self.archloop_medium_nights
+        ):
+            raise HarnessLoopError(
+                "harness_loop archloop_high_nights must be an integer >= "
+                "archloop_medium_nights"
+            )
+        if not isinstance(self.config_drift_allowed_profiles, tuple) or any(
+            not isinstance(profile, str) or not profile.strip()
+            for profile in self.config_drift_allowed_profiles
+        ):
+            raise HarnessLoopError(
+                "harness_loop config_drift_allowed_profiles must be a tuple of "
+                "non-empty strings"
+            )
+        if len(set(self.config_drift_allowed_profiles)) != len(
+            self.config_drift_allowed_profiles
+        ):
+            raise HarnessLoopError(
+                "harness_loop config_drift_allowed_profiles must not contain duplicates"
+            )
+        if not _is_positive_number(self.decision_latency_seconds):
+            raise HarnessLoopError(
+                "harness_loop decision_latency_seconds must be a positive number"
+            )
+        if not _is_positive_number(self.decision_latency_human_seconds):
+            raise HarnessLoopError(
+                "harness_loop decision_latency_human_seconds must be a positive number"
             )
 
 
@@ -421,6 +612,9 @@ class TaskRow:
     completed_at: int | None
     block_kind: str | None
     workspace_kind: str | None = None
+    # JSON-encoded ``skills`` pin array as stored on the card ("" when the
+    # column is NULL — parsed lazily by the pin-resolution sweep only).
+    skills_json: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,9 +667,15 @@ class BoardEvidence:
     runs_in_window: tuple[RunRow, ...]
     failure_events: tuple[FailureEvent, ...]
     children: dict[str, tuple[ChildInfo, ...]]
-    # (task_id, title, latest_blocked_at, reason) for every currently blocked
-    # task whose latest blocked event is known.
-    blocked_rows: tuple[tuple[str, str, int, str], ...]
+    # (task_id, title, latest_blocked_at, reason, block_kind) for every
+    # currently blocked task whose latest blocked event is known.
+    # ``block_kind`` resolves the typed ``tasks.block_kind`` column first,
+    # then the blocked event payload's ``kind``; None = unknown (callers
+    # fail toward reporting).
+    blocked_rows: tuple[tuple[str, str, int, str, str | None], ...]
+    # Every non-done, non-archived task row regardless of window (the pin
+    # sweep audits dispatchability, which is window-independent).
+    open_task_rows: tuple[TaskRow, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,6 +758,10 @@ class HarnessReport:
     # use fresh evidence; carried-open items render labeled and stay visible.
     carried_fps: frozenset[str] = frozenset()
     first_seen_by_fp: Mapping[str, int] = field(default_factory=dict)
+    # Escalation ladder (render-time only): fingerprint -> (stored, displayed,
+    # nights, chronic) for working-set entries past the escalation threshold.
+    # Display only — the stored severity and apply_kind are never touched.
+    escalation: Mapping[str, tuple[str, str, int, bool]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -645,6 +849,56 @@ def save_state(path: Path, state: dict) -> None:
         raise HarnessLoopError(f"cannot persist harness-loop state {path}: {exc}") from exc
 
 
+def prune_stale_entries(
+    state: dict,
+    state_path: Path,
+    *,
+    retention_days: int,
+    now: int,
+) -> tuple[int, Path | None]:
+    """Prune aged ``stale`` queue entries; return ``(pruned, backup_path)``.
+
+    Only ``fix_status="stale"`` entries whose ``last_seen`` predates
+    ``now - retention_days`` are removed.  ``open``, ``deferred``, and
+    ``resolved`` entries are NEVER pruned regardless of age — resolved rows
+    feed ``resolved_topics`` and the "Already fixed — skipped" report
+    section, and open/deferred rows are the working set.  Before the first
+    removal the whole state file is copied to a timestamped sibling backup:
+    the ledger is not reconstructible, so the first prune must be reversible.
+    The state dict is mutated in place; persist it with ``save_state``.
+    """
+    path = Path(state_path)
+    cutoff = int(now) - int(retention_days) * 86400
+    findings = state.get("open_findings")
+    if not isinstance(findings, list) or not findings:
+        return 0, None
+    keep: list[dict] = []
+    pruned = 0
+    for entry in findings:
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("fix_status", "open")) == "stale"
+            and int(entry.get("last_seen", 0) or 0) < cutoff
+        ):
+            pruned += 1
+            continue
+        keep.append(entry)
+    if pruned == 0:
+        return 0, None
+    backup: Path | None = None
+    if path.is_file():
+        backup = path.with_name(
+            f"{path.stem}.backup-"
+            + datetime.fromtimestamp(int(now), tz=timezone.utc).strftime(
+                "%Y%m%dT%H%M%SZ"
+            )
+            + path.suffix
+        )
+        shutil.copyfile(path, backup)
+    state["open_findings"] = keep
+    return pruned, backup
+
+
 def _resolved_entry(pattern: str, fp: str, *, how: str, source: str) -> dict:
     return {
         "topic": f"{pattern} ({fp})",
@@ -673,6 +927,51 @@ def rank_open_findings(open_findings: Sequence[dict]) -> list[dict]:
             int(entry.get("first_seen", 0) or 0),
         ),
     )
+
+
+def _escalation_for_entry(
+    entry: dict, *, config: "ControllerConfig"
+) -> tuple[str, str, int, bool] | None:
+    """Render-time escalation ``(stored, displayed, nights, chronic)`` or None.
+
+    Applies ONLY to entries whose ``fix_status`` is in ``_OPEN_FIX_STATUSES``
+    (open/deferred): ``occurrence_count`` nights of recurrence escalate the
+    DISPLAYED severity one step at ``escalate_after_nights`` and to HIGH plus
+    the CHRONIC tag at ``chronic_after_nights``.  The stored ``severity`` is
+    the detector's verdict and is never rewritten (dedupe/audit depend on
+    it), and ``apply_kind`` is untouched — escalation changes how loud a
+    finding is, never whether HKRC acts on it.
+    """
+    if str(entry.get("fix_status", "open")) not in _OPEN_FIX_STATUSES:
+        return None
+    stored = str(entry.get("severity", "medium")).casefold()
+    nights = int(entry.get("occurrence_count", 1) or 1)
+    ladder = config.harness_loop
+    if nights < ladder.escalate_after_nights:
+        return None
+    escalated = "high"
+    if nights < ladder.chronic_after_nights:
+        order = ("low", "medium", "high")
+        index = order.index(stored) if stored in order else 1
+        escalated = order[min(index + 1, 2)]
+    # Already-high entries still escalate: the returned tuple keeps the
+    # CHRONIC / nights streak visible even when severity cannot rise further
+    # (severity at max must not make the ladder invisible).
+    return (stored, escalated, nights, nights >= ladder.chronic_after_nights)
+
+
+def _escalation_map(
+    entries: Sequence[dict], *, config: "ControllerConfig"
+) -> dict[str, tuple[str, str, int, bool]]:
+    """Fingerprint -> escalation for every working-set entry that escalates."""
+    escalations: dict[str, tuple[str, str, int, bool]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        escalation = _escalation_for_entry(entry, config=config)
+        if escalation is not None:
+            escalations[str(entry.get("fingerprint", ""))] = escalation
+    return escalations
 
 
 def _entry_to_finding(entry: dict) -> Finding:
@@ -706,10 +1005,11 @@ def _upsert_open_finding(
 
     First occurrence creates the entry (``first_seen=now``,
     ``occurrence_count=1``, ``fix_status=open``); recurrence refreshes
-    ``last_seen`` and bumps ``occurrence_count``.  The stored payload is the
-    full Finding (evidence, suggestion, before/after, verify paths) so a
-    persisted, non-recurred item can be re-verified and applied from the
-    queue on a later night after its cooldown expires.
+    ``last_seen``, the evidence-bearing payload, and bumps
+    ``occurrence_count``.  The stored payload is the full Finding (evidence,
+    suggestion, before/after, verify paths) so a persisted, non-recurred
+    item can be re-verified and applied from the queue on a later night
+    after its cooldown expires.
     """
     fp = fingerprint(finding)
     entry = queue_by_fp.get(fp)
@@ -740,6 +1040,20 @@ def _upsert_open_finding(
     else:
         entry["last_seen"] = now
         entry["occurrence_count"] = int(entry.get("occurrence_count", 1) or 1) + 1
+        # t_48fcf459: the stored evidence was frozen at first_seen forever —
+        # a fixed detector kept feeding stale evidence to the report and the
+        # analyzer.  The evidence-bearing payload refreshes from the fresh
+        # Finding (the detector's current verdict); first_seen,
+        # occurrence_count, fingerprint, and fix_status stay untouched so
+        # streak continuity and dedupe survive byte for byte.
+        entry["severity"] = finding.severity
+        entry["evidence"] = list(finding.evidence)
+        entry["suggestion"] = finding.suggestion
+        entry["before"] = finding.before
+        entry["after"] = finding.after
+        entry["target_path"] = finding.target_path
+        entry["verify_path"] = finding.verify_path
+        entry["verify_text"] = finding.verify_text
         if finding.match_subject:
             entry["match_subject"] = finding.match_subject
         # A fresh recurrence reopens a closed lifecycle entry (e.g. one the
@@ -788,12 +1102,39 @@ def _main_skills_dir(config: "ControllerConfig") -> Path:
 
 
 def _profiles_root(config: "ControllerConfig") -> Path:
-    """Profiles root, derived two levels above the sessions database.
+    """Profiles root the assignee-profile sweeps read.
 
-    The sessions database lives at ``<profiles-root>/main/state.db``, so the
-    profiles root is exactly ``sessions_db.parent.parent``.
+    Explicit config knob wins, then ``HKRC_PROFILES_ROOT`` (parity with
+    ``persona_drift.default_profiles_root``), then the instance default.
+    Never derived from the sessions database path and never resolved via
+    ``Path.home()`` — see ``DEFAULT_PROFILES_ROOT``.
     """
-    return _resolve_sessions_db(config).parent.parent
+    configured = config.harness_loop.profiles_root.strip()
+    if configured:
+        return Path(configured).expanduser()
+    from_env = os.environ.get("HKRC_PROFILES_ROOT", "").strip()
+    if from_env:
+        return Path(from_env).expanduser()
+    return Path(DEFAULT_PROFILES_ROOT)
+
+
+def _archloop_output_dir(config: "ControllerConfig") -> Path:
+    """Archloop nightly-report root the skip-streak sweep reads.
+
+    Explicit config knob wins, then ``HKRC_ARCHLOOP_OUTPUT_DIR``, then the
+    explicit instance default (``DEFAULT_ARCHLOOP_OUTPUT_DIR``, the same
+    literal pattern as ``DEFAULT_PROFILES_ROOT``).  Never derived from the
+    sessions database path or ``Path.home()`` (see ``_profiles_root`` and
+    task t_ae960b7d: a derived root silently resolved to $HOME and
+    produced 10 false HIGHs a night).
+    """
+    configured = config.harness_loop.archloop_output_dir.strip()
+    if configured:
+        return Path(configured).expanduser()
+    from_env = os.environ.get("HKRC_ARCHLOOP_OUTPUT_DIR", "").strip()
+    if from_env:
+        return Path(from_env).expanduser()
+    return Path(DEFAULT_ARCHLOOP_OUTPUT_DIR)
 
 
 def _curator_logs_root(config: "ControllerConfig") -> Path:
@@ -1133,7 +1474,7 @@ def _collect_one_board(
         task_rows = connection.execute(
             """
             SELECT id, title, status, assignee, created_at, completed_at,
-                   block_kind, workspace_kind
+                   block_kind, workspace_kind, skills
               FROM tasks
              WHERE (created_at IS NOT NULL AND created_at >= ?)
                 OR (completed_at IS NOT NULL AND completed_at >= ?)
@@ -1153,8 +1494,40 @@ def _collect_one_board(
                 workspace_kind=(
                     str(row["workspace_kind"]) if row["workspace_kind"] else None
                 ),
+                skills_json=str(row["skills"]) if row["skills"] is not None else "",
             )
             for row in task_rows
+        )
+        # Window-independent sweep input: any card that could still be
+        # dispatched (never done/cancelled/archived).  The pin sweep audits
+        # dispatchability — a landmine stays a landmine however old the card.
+        open_task_rows = tuple(
+            TaskRow(
+                id=str(row["id"]),
+                title=str(row["title"] or ""),
+                status=str(row["status"]),
+                assignee=str(row["assignee"]) if row["assignee"] else None,
+                created_at=(
+                    int(row["created_at"]) if row["created_at"] is not None else None
+                ),
+                completed_at=(
+                    int(row["completed_at"]) if row["completed_at"] is not None else None
+                ),
+                block_kind=str(row["block_kind"]) if row["block_kind"] else None,
+                workspace_kind=(
+                    str(row["workspace_kind"]) if row["workspace_kind"] else None
+                ),
+                skills_json=str(row["skills"]) if row["skills"] is not None else "",
+            )
+            for row in connection.execute(
+                """
+                SELECT id, title, status, assignee, created_at, completed_at,
+                       block_kind, workspace_kind, skills
+                  FROM tasks
+                 WHERE status NOT IN ('done', 'cancelled', 'archived')
+                 ORDER BY id ASC
+                """
+            ).fetchall()
         )
         has_runs = (
             connection.execute(
@@ -1210,7 +1583,8 @@ def _collect_one_board(
         blocked_rows = connection.execute(
             """
             SELECT t.id AS tid, t.title AS title,
-                   latest.created_at AS blocked_at, latest.payload AS payload
+                   latest.created_at AS blocked_at, latest.payload AS payload,
+                   t.block_kind AS block_kind
               FROM tasks AS t
               JOIN task_events AS latest
                 ON latest.id = (
@@ -1230,6 +1604,7 @@ def _collect_one_board(
                 str(row["title"] or ""),
                 int(row["blocked_at"]),
                 _block_reason(row["payload"]),
+                _block_kind(row["block_kind"], row["payload"]),
             )
             for row in blocked_rows
         )
@@ -1244,6 +1619,7 @@ def _collect_one_board(
         failure_events=failures,
         children=children,
         blocked_rows=blocked,
+        open_task_rows=open_task_rows,
     )
 
 
@@ -1336,6 +1712,22 @@ def _block_reason(payload: str | None) -> str:
         return ""
     reason = parsed.get("reason")
     return str(reason) if isinstance(reason, str) else ""
+
+
+def _block_kind(column: object, payload: str | None) -> str | None:
+    """Typed block kind for a blocked row, or None when unavailable.
+
+    The ``tasks.block_kind`` column is authoritative; the latest blocked
+    event payload's ``kind`` field is the fallback for rows predating the
+    column.  ``None`` means "unknown" — callers fail toward reporting.
+    """
+    if column is not None and str(column).strip():
+        return str(column)
+    parsed = _parse_payload(payload)
+    if parsed is None:
+        return None
+    kind = parsed.get("kind")
+    return str(kind) if isinstance(kind, str) and kind.strip() else None
 
 
 def collect_curator_reports(
@@ -1451,6 +1843,46 @@ def _is_near_opener(text: str) -> bool:
     return text.strip(" \t.,!?;:") in _REASK_OPENER_TEXTS
 
 
+# Scripted probe/sentinel openers ("Reply with exactly: PROBE_OK", bare
+# PING/PONG, ...).  They recur identically across unrelated sessions weeks
+# apart as infrastructure liveness checks, never as a repeated human
+# question, so they must never form a reask finding (2026-09-02 live HIGH
+# reask:2674a1beb7f1 on two PROBE_OK probes).  Every variant below was
+# observed in one live 24h window: "Reply with exactly: PROBE_OK",
+# "Say exactly: PROBE_OK", "say exactly: pro_ok",
+# "Reply exactly FALLBACK_PROBE_OK", "reply with exactly: pong".  Matched
+# against the normalized (casefolded, whitespace-collapsed) single-line
+# first message; the optional instruction prefix covers the exact-reply
+# forms with or without "with"/colon.
+_REASK_PROBE_SENTINEL_RE = re.compile(
+    r"^(?:(?:reply|respond|say|answer)\s+(?:with\s+)?exactly:?\s*)?"
+    r"(?:fallback[-_ ]?probe[-_ ]?ok\d*|probe[-_ ]?ok\d*|direct[-_ ]?ok\d*"
+    r"|sentinel[-_ ]?ok\d*|pro[-_ ]?ok\d*|ping|pong|probe|sentinel)$"
+)
+
+# Shape cap: only a single-line first message of at most this many words can
+# be a scripted probe, so a real question that merely contains the word
+# 'ping' is still grouped and reported normally.
+_REASK_PROBE_MAX_WORDS = 10
+
+
+def _is_probe_sentinel(raw_text: str) -> bool:
+    """True when the first user message is a scripted probe/sentinel opener.
+
+    Shape-capped on purpose: the raw message must be exactly one line and
+    at most ``_REASK_PROBE_MAX_WORDS`` words after normalization, so
+    multi-line and wordy real questions can never match the sentinel
+    regex no matter what they contain.
+    """
+    lines = raw_text.splitlines()
+    if len(lines) != 1:
+        return False
+    normalized = _normalize_first_message(lines[0])
+    if len(normalized.split()) > _REASK_PROBE_MAX_WORDS:
+        return False
+    return _REASK_PROBE_SENTINEL_RE.fullmatch(normalized) is not None
+
+
 def detect_reask(sessions: Sequence[SessionRow]) -> tuple[Finding, ...]:
     """Identical/similar first user messages across fresh sessions.
 
@@ -1459,10 +1891,13 @@ def detect_reask(sessions: Sequence[SessionRow]) -> tuple[Finding, ...]:
     in the report; findings carry the normalized-message hash as their key.
 
     Excluded by construction (2026-08-14 operator-audited misclassification
-    fixes): sessions whose ``source`` is ``cron`` (scheduled runs, not
-    repeated human questions), first messages that are supervisor/cron
-    skill-injection prefaces, and conversational near-openers ('hi',
-    'status', 'use tts', greetings) that recur across unrelated chats.
+    fixes, plus the 2026-09-02 probe/sentinel fix): sessions whose
+    ``source`` is ``cron`` (scheduled runs, not repeated human questions),
+    first messages that are supervisor/cron skill-injection prefaces,
+    conversational near-openers ('hi', 'status', 'use tts', greetings) that
+    recur across unrelated chats, and scripted probe/sentinel openers
+    ('Reply with exactly: PROBE_OK', bare PING/PONG) that are liveness
+    checks, not re-derived context.
     """
     groups: dict[str, list[SessionRow]] = {}
     for session in sessions:
@@ -1472,6 +1907,8 @@ def detect_reask(sessions: Sequence[SessionRow]) -> tuple[Finding, ...]:
         if not text or text.startswith(_COMPACTION_HANDOFF_MARKERS):
             continue
         if _is_supervisor_preface(text) or _is_near_opener(text):
+            continue
+        if _is_probe_sentinel(session.first_user_message):
             continue
         groups.setdefault(text, []).append(session)
     findings: list[Finding] = []
@@ -1687,42 +2124,102 @@ def detect_outage_latency(
     return tuple(findings)
 
 
+def _is_human_gated_block(block_kind: str | None, reason: str) -> bool:
+    """Classify a blocked row: awaiting the human, or a machine block.
+
+    The typed ``block_kind`` (column or event payload ``kind``) wins;
+    when it is unavailable the free-text reason is the last resort, and
+    anything still unknown counts as machine-blocked (fail toward
+    reporting: a false positive is cheaper than a missed stuck worker).
+    """
+    if block_kind:
+        return block_kind == "needs_input"
+    normalized = " ".join(reason.casefold().split())
+    return "needs input" in normalized or "needs_input" in normalized
+
+
 def detect_decision_latency(
     boards: Sequence[BoardEvidence],
     *,
     now: int | None = None,
     threshold_seconds: int = DECISION_LATENCY_SECONDS,
+    human_threshold_seconds: int = DECISION_LATENCY_HUMAN_SECONDS,
 ) -> tuple[Finding, ...]:
-    """Decision latency: tasks blocked longer than 30 minutes.
+    """Decision latency: blocked tasks past their class's threshold.
 
-    Per board, the count of currently-blocked tasks whose latest blocked
-    event is older than the threshold becomes one finding (report-only; the
-    decision-latency watcher owns the automation).
+    Two classes of blocked card:
+
+    - machine-blocked (worker stuck, guard, dependency): a 30-minute
+      latency is a defect worth one finding per board.
+    - human-gated (``needs_input``): the card waits on Andre — no
+      automation can clear it, so 30 minutes proves nothing.  It gets its
+      own, far longer threshold (default 7 days): a human decision
+      genuinely rotting for weeks IS worth surfacing.
+
+    Classification ladder per task (fail toward REPORTING: a false
+    positive is cheaper than a missed stuck worker):
+
+    1. typed ``tasks.block_kind`` column (authoritative),
+    2. the latest blocked event payload's ``kind`` field,
+    3. the blocked reason free text (legacy rows),
+    4. unknown -> machine class (reported at the machine threshold).
+
+    Per board each class becomes at most one finding (report-only; the
+    human decides, nothing is auto-created).
     """
     current = int(time.time()) if now is None else int(now)
     findings: list[Finding] = []
     for board in boards:
-        old = [
-            (task_id, title, blocked_at)
-            for task_id, title, blocked_at, _reason in board.blocked_rows
-            if current - blocked_at > int(threshold_seconds)
-        ]
-        if not old:
-            continue
-        ids = ", ".join(task_id for task_id, _title, _at in old)
-        findings.append(
-            Finding(
-                pattern="decision-latency",
-                key=board.slug,
-                severity="medium",
-                evidence=(
-                    f"{len(old)} task(s) blocked >{int(threshold_seconds) // 60}min "
-                    f"on {board.slug} ({ids})",
-                ),
-                suggestion="auto-create the fix card inside the 30min window",
-                apply_kind="none",
+        machine: list[tuple[str, int]] = []
+        human: list[tuple[str, int]] = []
+        for task_id, _title, blocked_at, reason, block_kind in board.blocked_rows:
+            age = current - blocked_at
+            if _is_human_gated_block(block_kind, reason):
+                if age > int(human_threshold_seconds):
+                    human.append((task_id, blocked_at))
+            elif age > int(threshold_seconds):
+                machine.append((task_id, blocked_at))
+        if machine:
+            ids = ", ".join(task_id for task_id, _at in machine)
+            oldest = max((current - at for _tid, at in machine), default=0)
+            findings.append(
+                Finding(
+                    pattern="decision-latency",
+                    key=board.slug,
+                    severity="medium",
+                    evidence=(
+                        f"{len(machine)} machine-blocked task(s) stuck "
+                        f">{int(threshold_seconds) // 60}min on {board.slug} "
+                        f"({ids}; oldest {oldest // 3600}h) — workers not deciding",
+                    ),
+                    suggestion=(
+                        "check the stuck workers' block reasons and unblock or "
+                        "cancel them; these are machine blocks, not human gates"
+                    ),
+                    apply_kind="none",
+                )
             )
-        )
+        if human:
+            ids = ", ".join(task_id for task_id, _at in human)
+            oldest_days = max((current - at for _tid, at in human), default=0) // 86400
+            findings.append(
+                Finding(
+                    pattern="decision-latency",
+                    key=f"{board.slug}:needs_input",
+                    severity="medium",
+                    evidence=(
+                        f"{len(human)} human-gated task(s) awaiting Andre "
+                        f">{int(human_threshold_seconds) // 86400}d on {board.slug} "
+                        f"({ids}; oldest {oldest_days}d) — decisions blocked on you, "
+                        "not on automation",
+                    ),
+                    suggestion=(
+                        "Andre: answer, delegate, or cancel these decisions — "
+                        "no automation can clear a needs_input block"
+                    ),
+                    apply_kind="none",
+                )
+            )
     return tuple(findings)
 
 
@@ -1844,9 +2341,10 @@ def detect_review_required_loop(
         if not looped:
             continue
         blocked = {
-            task_id for task_id, _title, _at, _reason in board.blocked_rows
+            task_id
+            for task_id, _title, _at, _reason, _kind in board.blocked_rows
         }
-        for task_id, _title, _at, reason in board.blocked_rows:
+        for task_id, _title, _at, reason, _kind in board.blocked_rows:
             if task_id not in looped or task_id not in blocked:
                 continue
             if not reason.startswith(REVIEW_REQUIRED_PREFIX):
@@ -1886,6 +2384,85 @@ def detect_review_required_loop(
     return tuple(findings)
 
 
+def retry_exhaustion_suppressed(boards: Sequence[BoardEvidence]) -> tuple[str, ...]:
+    """``board:task_id`` keys whose retry-exhaustion finding is suppressed
+    because the card already reached a terminal status.
+
+    Derived from the SAME board snapshot ``detect_retry_exhaustion`` reads,
+    so the report can tell "0 retry-exhaustion findings" apart from "N
+    suppressed as already recovered" without re-querying the boards.
+    """
+    return _retry_exhaustion_partition(boards)[1]
+
+
+def retry_exhaustion_census(boards: Sequence[BoardEvidence]) -> tuple[int, int]:
+    """``(evaluated, suppressed)`` retry-exhaustion candidate counts.
+
+    ``evaluated`` is the number of distinct cards with a latest ``gave_up``
+    trip in the window; ``suppressed`` the subset already terminal.  The run
+    summary reports both so a live run where every candidate is suppressed
+    (the expected 2026-09-01+ shape) is never indistinguishable from a
+    broken detector.
+    """
+    latest, suppressed = _retry_exhaustion_partition(boards)
+    return len(latest), len(suppressed)
+
+
+def _retry_exhaustion_partition(
+    boards: Sequence[BoardEvidence],
+) -> tuple[dict[str, FailureEvent], tuple[str, ...]]:
+    """Latest ``gave_up`` trip per card, split by card currency.
+
+    Returns ``(latest, suppressed_keys)``.  A card counts as recovered —
+    its trip suppressed — only on POSITIVE terminal-status evidence from
+    the snapshot:
+
+    - the card is absent from ``open_task_rows``, which holds every
+      non-done/non-cancelled/non-archived row regardless of window (the
+      same transaction that filled ``status_counts``), or
+    - ``open_task_rows`` is empty AND ``status_counts`` proves the board
+      holds zero non-terminal tasks (the card's own status is terminal).
+
+    An empty ``open_task_rows`` WITHOUT that proof (hand-built snapshot,
+    non-native board skip, partial sweep) is "evidence unavailable", not
+    "board has no open tasks": the trip stays in ``latest`` and escalates —
+    a false positive is cheaper than a missed real escalation.
+    """
+    latest: dict[str, FailureEvent] = {}
+    suppressed: list[str] = []
+    for board in boards:
+        open_ids = {task.id for task in board.open_task_rows}
+        # "Board has no open tasks" needs proof; "evidence unavailable"
+        # fails toward reporting.  A non-empty status_counts with zero
+        # non-terminal rows proves it; an EMPTY status_counts proves
+        # nothing (vacuous truth) and must not suppress.
+        empty_open_is_proof = (
+            not open_ids
+            and bool(board.status_counts)
+            and not any(
+                count > 0 and status not in _TERMINAL_TASK_STATUSES
+                for status, count in board.status_counts
+            )
+        )
+        for event in board.failure_events:
+            if event.kind != GAVE_UP_KIND:
+                continue
+            key = f"{board.slug}:{event.task_id}"
+            previous = latest.get(key)
+            if previous is not None and event.created_at < previous.created_at:
+                continue
+            latest[key] = event
+            # Primary evidence: a NON-EMPTY open sweep that omits the card
+            # (vacuously true when the sweep is empty — not evidence).
+            # Fallback: status_counts proves the board holds zero open
+            # tasks.  Neither holds: fail toward reporting.
+            if key not in suppressed and (
+                (open_ids and event.task_id not in open_ids) or empty_open_is_proof
+            ):
+                suppressed.append(key)
+    return latest, tuple(suppressed)
+
+
 def detect_retry_exhaustion(
     boards: Sequence[BoardEvidence],
     *,
@@ -1911,18 +2488,21 @@ def detect_retry_exhaustion(
     senior-dev blocks the card with a precise reason; no silent drops.
     Report-only (apply_kind="none") so live mode never auto-creates a
     ticket: same signal, same routing, every run.
+
+    Terminal-status cards are skipped (t_b905b49e): a ``gave_up`` trip on a
+    card that has since reached ``done``/``cancelled``/``archived`` is a
+    recovered card, not an open escalation — the 2026-09-01 production run
+    re-escalated 5 finished cards because the trip event was consulted
+    without the card's current status.  Suppression requires positive
+    terminal-status evidence from the snapshot (see
+    ``_retry_exhaustion_partition``); without it the finding still fires.
+    Suppressed cards remain traceable via ``retry_exhaustion_suppressed``.
     """
-    latest: dict[str, FailureEvent] = {}
-    for board in boards:
-        for event in board.failure_events:
-            if event.kind != GAVE_UP_KIND:
-                continue
-            key = f"{board.slug}:{event.task_id}"
-            previous = latest.get(key)
-            if previous is None or event.created_at >= previous.created_at:
-                latest[key] = event
+    latest, suppressed = _retry_exhaustion_partition(boards)
     findings: list[Finding] = []
     for key in sorted(latest):
+        if key in suppressed:
+            continue
         event = latest[key]
         board_slug, task_id = key.split(":", 1)
         payload: dict[str, object] = {}
@@ -2046,6 +2626,317 @@ def detect_skill_contradictions(
     return tuple(findings)
 
 
+def _parse_pinned_skills(skills_json: str) -> tuple[str, ...]:
+    """Parse a card's ``skills`` JSON column into pinned skill names.
+
+    Tolerant by design: a NULL/empty column, malformed JSON, a non-list, or
+    non-string entries yield no pins rather than an exception — the sweep
+    reports pin resolvability, not JSON hygiene.
+    """
+    stripped = (skills_json or "").strip()
+    if not stripped:
+        return ()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(
+        name.strip() for name in parsed if isinstance(name, str) and name.strip()
+    )
+
+
+def _dist_skill_names(dist_root: Path) -> frozenset[str] | None:
+    """Skill names resolvable from the dist root, or None when it is absent.
+
+    Ground truth re-verified 2026-08-31 (task t_3de7f74e): worker profiles
+    resolve force-loaded skills ONLY from this dist root, and a skill
+    resolves when a directory under it contains a ``SKILL.md`` (the parent
+    directory name is the skill name).  Never shell out to
+    ``hermes skills inspect``/``list`` — inspect always exits 0 and hangs
+    when the skill resolves; the list table truncates names.  A missing
+    root returns None so the sweep emits no findings instead of raising.
+    """
+    root = Path(dist_root)
+    if not root.is_dir():
+        return None
+    try:
+        return frozenset(
+            path.parent.name for path in root.rglob("SKILL.md") if path.is_file()
+        )
+    except OSError:
+        return None
+
+
+def _profile_private_owner(skill: str, profiles_root: Path) -> str:
+    """First persona (sorted) whose profile-private skills dir holds ``skill``.
+
+    Profile-private skill dirs resolve for NOBODY — not even that persona —
+    so their existence is evidence context, never a resolution.
+    """
+    root = Path(profiles_root)
+    if not root.is_dir():
+        return ""
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return ""
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        if (entry / "skills" / skill / "SKILL.md").is_file():
+            return entry.name
+    return ""
+
+
+def _assignee_profile_name(assignee: str | None) -> str:
+    """Worker profile an assignee string dispatches to (prefix before ':').
+
+    Live cards carry free-text directives after the profile name
+    ("reviewer: synthesize swarm"); only the prefix names the profile.
+    An empty or unset assignee is not a profile miss — the dispatcher's
+    default lane is out of scope for this sweep.
+    """
+    if not assignee or not assignee.strip():
+        return ""
+    return assignee.split(":", 1)[0].strip()
+
+
+def detect_unresolvable_skill_pin(
+    boards: Sequence[BoardEvidence],
+    *,
+    dist_skills_root: Path,
+    profiles_root: Path,
+) -> tuple[Finding, ...]:
+    """Flag cards that can never dispatch cleanly (t_3de7f74e).
+
+    Read-only, snapshot-fed sweep over every board's ``open_task_rows``
+    (window-independent: a landmine stays a landmine however old the card;
+    done/cancelled/archived cards are skipped by the collector).  Two
+    finding kinds:
+
+    ``skill-unresolvable`` — a card pins a force-loaded skill absent from
+    the dist root.  Severity is ``high`` when EVERY pinned skill is missing
+    (Hermes core raises ``ValueError("Unknown skill(s): ...")`` at spawn
+    when nothing loaded) and ``medium`` when only some are (core degrades
+    gracefully and continues).  One finding per card carries every
+    unresolvable name; when a missing skill sits in some persona's
+    profile-private dir, the evidence names that persona — a location no
+    worker profile resolves from, not even its owner.
+
+    ``assignee-no-profile`` — the card's assignee names a worker profile
+    with no directory under the profiles root; such a card can never
+    dispatch either.
+
+    Both kinds are strictly report-only (``apply_kind="none"``): HKRC never
+    installs, symlinks, or copies a skill and never edits a card's
+    ``skills`` column (decision t_7dca44ce batch-1 #3; auto-repair rejected
+    2026-08-31).  A missing dist root emits no findings.  Remediation is
+    shipping the skill to the dist or dropping the pin — NEVER reassigning
+    the persona, which is the wrong remedy for this failure class.
+    """
+    dist_names = _dist_skill_names(Path(dist_skills_root))
+    profiles_root = Path(profiles_root)
+    # A missing profiles root cannot dispatch anyone; like a missing dist
+    # root it is tolerated with no findings rather than mass-flagging.
+    profiles_resolvable = profiles_root.is_dir()
+    findings: list[Finding] = []
+    for board in boards:
+        for task in board.open_task_rows:
+            key = f"{board.slug}:{task.id}"
+            if dist_names is not None:
+                pins = _parse_pinned_skills(task.skills_json)
+                missing = [name for name in pins if name not in dist_names]
+                if missing:
+                    severity = "high" if len(missing) == len(pins) else "medium"
+                    owner_notes = []
+                    for name in sorted(missing):
+                        owner = _profile_private_owner(name, Path(profiles_root))
+                        if owner:
+                            owner_notes.append(
+                                f"{name} sits in {owner}'s profile-private "
+                                "skills dir (resolved by NOBODY, not even "
+                                f"{owner})"
+                            )
+                    private = (" " + "; ".join(owner_notes)) if owner_notes else ""
+                    findings.append(
+                        Finding(
+                            pattern=SKILL_UNRESOLVABLE_PATTERN,
+                            key=key,
+                            severity=severity,
+                            evidence=(
+                                f"card {task.id} on board {board.slug} (status "
+                                f"{task.status}, assignee "
+                                f"{task.assignee or 'unset'}) pins skill(s) "
+                                f"{', '.join(sorted(missing))} with no match "
+                                f"under the dist root {Path(dist_skills_root)} "
+                                "— the only location worker profiles resolve "
+                                f"force-loaded skills from.{private}",
+                            ),
+                            suggestion=(
+                                "ship the pinned skill into the dist root "
+                                "(a directory with a SKILL.md) or drop the "
+                                "pin from the card; never reassign the "
+                                "persona — the pin, not the persona, is "
+                                "what is unresolvable"
+                            ),
+                            apply_kind="none",
+                        )
+                    )
+            profile = _assignee_profile_name(task.assignee)
+            if (
+                profiles_resolvable
+                and profile
+                and not (profiles_root / profile).is_dir()
+            ):
+                findings.append(
+                    Finding(
+                        pattern=ASSIGNEE_NO_PROFILE_PATTERN,
+                        key=key,
+                        severity="high",
+                        evidence=(
+                            f"card {task.id} on board {board.slug} (status "
+                            f"{task.status}) is assigned to {profile!r}, which "
+                            "has no worker profile directory under "
+                            f"{Path(profiles_root)} — dispatch can never "
+                            "resolve it",
+                        ),
+                        suggestion=(
+                            "assign the card to an existing worker profile "
+                            "(or create the missing profile deliberately); "
+                            "report-only — the sweep never edits the card"
+                        ),
+                        apply_kind="none",
+                    )
+                )
+    return tuple(findings)
+
+
+# One SKIPPED-class line of the archloop nightly summary block, e.g.
+# ``SKIPPED dirty (2): campcli ynab-pilot``.
+_ARCHLOOP_SKIP_LINE = re.compile(
+    r"^SKIPPED\s+(\S+)\s+\((\d+)\):\s*(.*)$"
+)
+
+
+def _archloop_night_stamp(text: str) -> str:
+    """First ``archloop-night <date> <time>`` stamp in a report, else ''."""
+    match = re.search(r"^archloop-night\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", text, re.MULTILINE)
+    return match.group(1) if match else ""
+
+
+def _parse_archloop_skips(text: str) -> dict[str, list[str]]:
+    """Parse the trailing ``SKIPPED <class> (N): names`` lines of one report.
+
+    Returns class -> repo names in file order.  Unparseable text yields an
+    empty mapping — a malformed report is skipped, never fatal.
+    """
+    skips: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        match = _ARCHLOOP_SKIP_LINE.match(line.strip())
+        if not match:
+            continue
+        skip_class, _count, names = match.groups()
+        repos = [name for name in names.split() if name]
+        if repos:
+            skips.setdefault(skip_class, []).extend(repos)
+    return skips
+
+
+def detect_archloop_skip_streak(
+    reports_root: Path,
+    *,
+    actionable_classes: tuple[str, ...] = ACTIONABLE_SKIP_CLASSES,
+    medium_nights: int = ARCHLOOP_MEDIUM_NIGHTS,
+    high_nights: int = ARCHLOOP_HIGH_NIGHTS,
+) -> tuple[Finding, ...]:
+    """Flag repos the archloop nightly refactor kept skipping (t_ba4092e4).
+
+    Reads the archloop nightly cron reports (one ``.md`` per night under
+    ``reports_root``, config knob ``harness_loop.archloop_output_dir``) and
+    tracks, per repo, how many CONSECUTIVE REPORT FILES listed it under an
+    actionable skip class.  A "night" is one report file: streaks count
+    observed runs, never calendar days, so a cron outage cannot inflate a
+    neglect streak (orchestrator correction 2026-09-01 — the live archive
+    is missing nine calendar nights and counting days would nearly double
+    campcli's streak).
+
+    Only operator-fixable skip classes escalate; the default set is
+    ``("dirty",)`` (a stray untracked file silently costing weeks of
+    nightly refactoring).  ``not-on-main`` is deliberately NOT actionable
+    by default: being off main is the normal permanent state of a feature
+    worktree (rentcli-wt-realtorca, 17 consecutive report nights).
+    ``no-new-commits`` and ``board-archived`` are normal and never flagged.
+
+    Strictly report-only (``apply_kind="none"``): HKRC proposes, it never
+    cleans a developer's checkout.  A missing/empty/unreadable root yields
+    zero findings without raising — fail-safe, never fail-loud.  A repo's
+    ``key`` is its name, so ``fingerprint()`` is
+    ``archloop-skip-streak:<repo>`` and the occurrence machinery tracks the
+    streak across nights without duplicating entries.
+    """
+    root = Path(reports_root)
+    if not root.is_dir():
+        return ()
+    # Sorted by filename: the nightly files are zero-padded timestamps
+    # (2026-08-05_00-31-02.md), so lexicographic order == chronological.
+    try:
+        paths = sorted(path for path in root.iterdir() if path.is_file())
+    except OSError:
+        return ()
+    streaks: dict[str, list[str]] = {}
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        skips = _parse_archloop_skips(text)
+        if not skips:
+            # Unparseable / empty / truncated report: not an observed night.
+            continue
+        skipped_actionable = {
+            repo
+            for skip_class, repos in skips.items()
+            if skip_class in actionable_classes
+            for repo in repos
+        }
+        for repo in tuple(streaks):
+            if repo not in skipped_actionable:
+                del streaks[repo]
+        for repo in skipped_actionable:
+            streaks.setdefault(repo, []).append(_archloop_night_stamp(text) or path.name)
+    findings: list[Finding] = []
+    classes_text = ", ".join(actionable_classes)
+    for repo, nights in sorted(streaks.items()):
+        streak = len(nights)
+        if streak < medium_nights:
+            continue
+        severity = "high" if streak >= high_nights else "medium"
+        findings.append(
+            Finding(
+                pattern=ARCHLOOP_SKIP_STREAK_PATTERN,
+                key=repo,
+                severity=severity,
+                evidence=(
+                    f"repo {repo} skipped ({classes_text}) for {streak} "
+                    "consecutive archloop report nights (a night = one "
+                    f"report file; streaks never count calendar days), "
+                    f"first night of the streak {nights[0]} — reports root "
+                    f"{root}",
+                ),
+                suggestion=(
+                    "inspect the repo for the operator-fixable condition "
+                    f"({classes_text}) — e.g. an untracked or modified file "
+                    "blocking the nightly refactor — and clear it; "
+                    "report-only — HKRC never cleans a checkout itself"
+                ),
+                apply_kind="none",
+            )
+        )
+    return tuple(findings)
+
+
 def _line_containing(text: str, match: re.Match[str]) -> str:
     for line in text.splitlines():
         if match.group(0).casefold() in line.casefold():
@@ -2053,14 +2944,25 @@ def _line_containing(text: str, match: re.Match[str]) -> str:
     return ""
 
 
-def detect_config_drift(profiles_root: Path) -> tuple[Finding, ...]:
-    """Diff ``model.default`` across profiles (config drift)."""
+def detect_config_drift(
+    profiles_root: Path, allowed_profiles: tuple[str, ...] = ()
+) -> tuple[Finding, ...]:
+    """Diff ``model.default`` across profiles (config drift).
+
+    ``allowed_profiles`` declares deliberate per-profile pins (t_48fcf459):
+    a listed profile's divergence stops being flagged while every
+    UNDECLARED divergence still is.  Empty (the default) = flag all
+    divergence, byte-identical to the pre-knob behaviour.
+    """
+    excluded = {profile.strip() for profile in allowed_profiles if profile.strip()}
     models: dict[str, str] = {}
     root = Path(profiles_root)
     if not root.is_dir():
         return ()
     for profile_dir in sorted(root.iterdir()):
         if not profile_dir.is_dir():
+            continue
+        if profile_dir.name in excluded:
             continue
         config_yaml = profile_dir / "config.yaml"
         if not config_yaml.is_file():
@@ -3637,6 +4539,9 @@ _PATTERN_TITLES = {
     "retry-exhaustion": "Retry-exhausted card (dispatch budget spent)",
     "skill-contradiction": "Contradictory skill instructions",
     "config-drift": "Configuration drift",
+    "skill-unresolvable": "Unresolvable pinned skill (spawn will fail)",
+    "assignee-no-profile": "Assignee has no worker profile (cannot dispatch)",
+    "archloop-skip-streak": "Archloop skip streak (nightly refactor not running)",
 }
 
 # Wait-what problem prose per pattern: plain-English description, no codes,
@@ -3655,6 +4560,9 @@ _PATTERN_PROBLEMS: dict[str, str] = {
     "retry-exhaustion": "A card exhausted its dispatch retry budget.",
     "skill-contradiction": "A skill teaches two contradictory instructions about when to complete a task.",
     "config-drift": "Profiles use different default models.",
+    "skill-unresolvable": "A card pins a force-loaded skill no worker profile can resolve, so its dispatch will crash or degrade.",
+    "assignee-no-profile": "A card is assigned to a worker profile that does not exist, so it can never dispatch.",
+    "archloop-skip-streak": "The archloop nightly refactor has skipped a repo for consecutive report nights, so refactoring silently stopped.",
 }
 
 # Human-form recommended solutions, keyed by the exact suggestion text the
@@ -3771,6 +4679,15 @@ def _minutes_of(finding: Finding) -> int:
     return 0
 
 
+def _days_of(finding: Finding) -> int:
+    """Human-gated evidence names its window in days (``>7d``)."""
+    for line in finding.evidence:
+        match = re.search(r">(\d+)d\b", line)
+        if match:
+            return int(match.group(1))
+    return 0
+
+
 def _sessions_of(finding: Finding) -> int:
     for line in finding.evidence:
         match = re.search(r"(\d+)\s*fresh sessions", line)
@@ -3832,10 +4749,24 @@ def _problem_text(pattern: str, group: Sequence[Finding]) -> str:
             return f"{size} outages took up to {hours} hours from report to fix."
         return problem.format(hours=hours)
     if pattern == "decision-latency":
-        minutes = max(_minutes_of(f) for f in group)
-        if size > 1:
-            return f"{size} boards have tasks blocked more than {minutes} minutes."
-        return problem.format(minutes=minutes)
+        human = [f for f in group if f.key.endswith(":needs_input")]
+        machine = [f for f in group if not f.key.endswith(":needs_input")]
+        if machine:
+            minutes = max(_minutes_of(f) for f in machine)
+            if human:
+                days = max(_days_of(f) for f in human)
+                return (
+                    f"Tasks have been blocked for more than {minutes} minutes, "
+                    f"and decisions have been awaiting the operator for more "
+                    f"than {days} days."
+                )
+            if len(machine) > 1:
+                return f"{len(machine)} boards have tasks blocked more than {minutes} minutes."
+            return problem.format(minutes=minutes)
+        days = max(_days_of(f) for f in human)
+        if len(human) > 1:
+            return f"{len(human)} boards have decisions awaiting the operator for more than {days} days."
+        return f"Decisions have been awaiting the operator for more than {days} days."
     if pattern == "retry-exhaustion":
         if size > 1:
             return f"{size} cards exhausted their dispatch retry budget."
@@ -3876,15 +4807,32 @@ def _format_applied(change: AppliedChange) -> str:
     )
 
 
-def _group_findings(findings: Sequence[Finding]) -> list[tuple[str, list[Finding]]]:
-    """Order findings by severity (high first), grouped by pattern."""
-    grouped: dict[str, list[Finding]] = {}
+def _group_findings(
+    findings: Sequence[Finding],
+    escalation: Mapping[str, tuple[str, str, int, bool]] | None = None,
+) -> list[tuple[str, list[Finding]]]:
+    """Order findings by severity (high first), grouped by pattern.
+
+    When an ``escalation`` map is given, entries of the same pattern with
+    DIFFERENT escalation levels render as separate sections — a chronic
+    entry must not disappear behind a plain header that happens to share its
+    pattern.  The split key is the escalation tuple itself (or ``None``), so
+    grouping stays deterministic.
+    """
+    escalations = escalation or {}
+    grouped: dict[tuple[str, tuple[str, str, int, bool] | None], list[Finding]] = {}
     for finding in findings:
-        grouped.setdefault(finding.pattern, []).append(finding)
-    return sorted(
+        esc = escalations.get(fingerprint(finding))
+        grouped.setdefault((finding.pattern, esc), []).append(finding)
+    ordered = sorted(
         grouped.items(),
-        key=lambda item: (-_SEVERITY_ORDER.get(item[1][0].severity, 0), item[0]),
+        key=lambda item: (
+            -_SEVERITY_ORDER.get(item[1][0].severity, 0),
+            item[0][0],
+            str(item[0][1]),
+        ),
     )
+    return [(pattern, members) for (pattern, _esc), members in ordered]
 
 
 def _carried_problem_text(
@@ -3919,10 +4867,40 @@ def _carried_problem_text(
     )
 
 
+def _severity_header(
+    pattern: str,
+    group: Sequence[Finding],
+    escalation: Mapping[str, tuple[str, str, int, bool]] | None,
+) -> str:
+    """Section header with the escalation ladder applied at render time.
+
+    ``MEDIUM — Title`` stays unchanged without escalation; a recurring
+    working-set entry renders ``MEDIUM→HIGH (N nights)`` and a chronic one
+    ``MEDIUM→HIGH (CHRONIC, 29 nights)``.  An already-HIGH chronic entry
+    still shows its streak (``HIGH (CHRONIC, 29 nights)``) so the ladder
+    stays visible when severity cannot rise further.  The stored severity is
+    never modified — this is display only.
+    """
+    severity = (group[0].severity or "medium").upper()
+    title = _PATTERN_TITLES.get(pattern, pattern.replace("-", " ").title())
+    esc = escalation.get(fingerprint(group[0])) if escalation else None
+    if esc is None:
+        return f"{severity} — {title}"
+    stored, displayed, nights, chronic = esc
+    token = (
+        severity
+        if displayed == stored.casefold()
+        else f"{stored.upper()}→{displayed.upper()}"
+    )
+    suffix = f" (CHRONIC, {nights} nights)" if chronic else f" ({nights} nights)"
+    return f"{token}{suffix} — {title}"
+
+
 def _render_wrong(
     findings: Sequence[Finding],
     carried_fps: frozenset[str] = frozenset(),
     first_seen_by_fp: Mapping[str, int] | None = None,
+    escalation: Mapping[str, tuple[str, str, int, bool]] | None = None,
 ) -> list[str]:
     """Render 'What's wrong': fresh items first, carried-open items labeled.
 
@@ -3939,11 +4917,9 @@ def _render_wrong(
     first_seen = dict(first_seen_by_fp or {})
     lines: list[str] = []
     budget = 5
-    fresh_groups = _group_findings(fresh_items)
+    fresh_groups = _group_findings(fresh_items, escalation)
     for index, (pattern, group) in enumerate(fresh_groups[:budget], start=1):
-        severity = (group[0].severity or "medium").upper()
-        title = _PATTERN_TITLES.get(pattern, pattern.replace("-", " ").title())
-        lines.append(f"{index}. {severity} — {title}")
+        lines.append(f"{index}. {_severity_header(pattern, group, escalation)}")
         lines.append(f"   Problem: {_problem_text(pattern, group)}")
         lines.append(f"   Recommended solution: {_solution_text(pattern, group)}")
         lines.append("")
@@ -3952,11 +4928,12 @@ def _render_wrong(
     if carried_items and remaining > 0:
         lines.append("Carried open findings (persisted queue):")
         for index, (pattern, group) in enumerate(
-            _group_findings(carried_items)[:remaining], start=consumed + 1
+            _group_findings(carried_items, escalation)[:remaining], start=consumed + 1
         ):
-            severity = (group[0].severity or "medium").upper()
-            title = _PATTERN_TITLES.get(pattern, pattern.replace("-", " ").title())
-            lines.append(f"{index}. {severity} — {title} (carried open)")
+            lines.append(
+                f"{index}. {_severity_header(pattern, group, escalation)}"
+                " (carried open)"
+            )
             lines.append(
                 f"   Problem: {_carried_problem_text(pattern, group, first_seen)}"
             )
@@ -3977,6 +4954,7 @@ def render_report(report: HarnessReport) -> str:
             report.wrong,
             carried_fps=report.carried_fps,
             first_seen_by_fp=report.first_seen_by_fp,
+            escalation=report.escalation,
         )
     )
     lines += ["", "Already fixed — skipped"]
@@ -4025,13 +5003,37 @@ def _detect_all(
     findings.extend(detect_fix_chain(boards))
     commits = parse_git_log(log_text)
     findings.extend(detect_outage_latency(commits, sessions))
-    findings.extend(detect_decision_latency(boards, now=current))
+    findings.extend(
+        detect_decision_latency(
+            boards,
+            now=current,
+            threshold_seconds=int(config.harness_loop.decision_latency_seconds),
+            human_threshold_seconds=int(
+                config.harness_loop.decision_latency_human_seconds
+            ),
+        )
+    )
     reviewer_profiles = config.watcher.reviewer_profiles or _REVIEWER_PROFILES_FALLBACK
     findings.extend(detect_review_pair_gap(boards, reviewer_profiles=reviewer_profiles))
     findings.extend(detect_review_required_loop(boards, skill_roots=_skill_roots(config)))
     findings.extend(detect_retry_exhaustion(boards))
     findings.extend(detect_skill_contradictions(_skill_roots(config)))
-    findings.extend(detect_config_drift(_profiles_root(config)))
+    findings.extend(detect_config_drift(_profiles_root(config), allowed_profiles=config.harness_loop.config_drift_allowed_profiles))
+    findings.extend(
+        detect_unresolvable_skill_pin(
+            boards,
+            dist_skills_root=Path(config.harness_loop.dist_skills_root),
+            profiles_root=_profiles_root(config),
+        )
+    )
+    findings.extend(
+        detect_archloop_skip_streak(
+            _archloop_output_dir(config),
+            actionable_classes=tuple(config.harness_loop.archloop_actionable_classes),
+            medium_nights=config.harness_loop.archloop_medium_nights,
+            high_nights=config.harness_loop.archloop_high_nights,
+        )
+    )
     return tuple(findings)
 
 
@@ -4315,7 +5317,23 @@ def run(
         entry["last_deferral_reason"] = reason
         entry["revalidated_at"] = current
         entry["revalidation"] = {"outcome": "deferred", "reason": reason}
-    save_state(state_file, updated)
+    if dry_run:
+        # Dry-run is audit+report only: an operator preview must leave the
+        # live ledger byte-identical (queue transitions, pruning, and the
+        # pre-prune backup persist on live runs — the cron shim flips
+        # --no-dry-run after operator review).
+        pruned_stale = 0
+    else:
+        # Ledger hygiene: prune aged ``stale`` entries (never open/deferred/
+        # resolved) behind a one-time timestamped backup before the state is
+        # persisted, so the file cannot grow unbounded.
+        pruned_stale, _prune_backup = prune_stale_entries(
+            updated,
+            state_file,
+            retention_days=config.harness_loop.stale_retention_days,
+            now=current,
+        )
+        save_state(state_file, updated)
 
     analysis_story = {
         "ok": f"analysis ok ({len(analysis.proposals)} proposal(s))",
@@ -4334,22 +5352,48 @@ def run(
         if str(entry.get("fix_status", "open")) in _OPEN_FIX_STATUSES
         and str(entry.get("fingerprint", "")) not in fresh_by_fp
     )
+    # Counts basis (stated explicitly): the working set is the open/deferred
+    # subset of the ledger; the ledger also holds stale and resolved rows, so
+    # a bare "N carried-open findings" cannot be compared against the file.
+    working_open = sum(
+        1
+        for entry in updated.get("open_findings", [])
+        if str(entry.get("fix_status", "open")) in _OPEN_FIX_STATUSES
+    )
+    ledger_entries = len(updated.get("open_findings", []))
     fresh_word = "finding" if len(fresh) == 1 else "findings"
     carried_word = "finding" if carried_open == 1 else "findings"
+    working_word = "finding" if working_open == 1 else "findings"
     story = (
         f"window {window_hours}h: {len(sessions)} sessions, "
         f"{len(fresh)} new {fresh_word} in this 24h window "
         f"({sum(1 for f in fresh if f.severity == 'high')} high), "
         f"{carried_open} carried-open {carried_word} in the persistent queue, "
+        f"{working_open} open/deferred {working_word} in the working set "
+        f"({ledger_entries} total ledger entries; counts cover the "
+        f"open/deferred working set only), "
         f"{len(applied)} routed, {len(updated.get('resolved_topics', []))} resolved topics"
         f"; {analysis_story}"
     )
+    if pruned_stale:
+        pruned_word = "finding" if pruned_stale == 1 else "findings"
+        story += (
+            f"; pruned {pruned_stale} stale {pruned_word} older than "
+            f"{config.harness_loop.stale_retention_days}d"
+        )
     escalations = sum(1 for f in fresh if f.pattern == RETRY_EXHAUSTION_PATTERN)
     if escalations:
         card_word = "card" if escalations == 1 else "cards"
         story += (
             f"; {escalations} retry-exhausted {card_word} "
             f"escalated to {ESCALATION_ASSIGNEE}"
+        )
+    evaluated_retries, suppressed_count = retry_exhaustion_census(boards)
+    if evaluated_retries:
+        story += (
+            f"; retry-exhaustion census: {evaluated_retries} candidate(s) "
+            f"evaluated, {suppressed_count} suppressed as already recovered "
+            f"(terminal status)"
         )
     if notes:
         story += " — " + "; ".join(notes[:2])
@@ -4398,6 +5442,9 @@ def run(
         analysis_failed=analysis.reason if analysis.status == "failed" else "",
     )
 
+    escalation_map = _escalation_map(
+        updated.get("open_findings", []), config=config
+    )
     report = HarnessReport(
         story=story,
         wrong=wrong,
@@ -4410,6 +5457,7 @@ def run(
         deferrals=deferrals,
         carried_fps=carried_fps,
         first_seen_by_fp=first_seen_by_fp,
+        escalation=escalation_map,
     )
     if trace is not None:
         trace.append(
@@ -4428,6 +5476,8 @@ def run(
                 "applied": [change.note for change in applied],
                 "deferrals": list(deferrals),
                 "resolved_topics_count": len(updated.get("resolved_topics", [])),
+                "pruned_stale": pruned_stale,
+                "ledger_entries": ledger_entries,
                 "git_commits_count": len(parse_git_log(log_text)),
             }
         )
@@ -4447,6 +5497,7 @@ __all__ = [
     "DEFAULT_HERMES_BIN",
     "DEFAULT_HKRC_REPO",
     "DECISION_LATENCY_SECONDS",
+    "DECISION_LATENCY_HUMAN_SECONDS",
     "DENSITY_THRESHOLD_PER_MSG",
     "ESCALATION_ASSIGNEE",
     "FailureEvent",
@@ -4483,13 +5534,17 @@ __all__ = [
     "detect_review_required_loop",
     "detect_retry_exhaustion",
     "detect_skill_contradictions",
+    "detect_unresolvable_skill_pin",
     "fingerprint",
     "git_log_since",
     "load_state",
     "parse_git_log",
+    "prune_stale_entries",
     "rank_open_findings",
     "render_report",
     "revalidate_open_findings",
+    "retry_exhaustion_census",
+    "retry_exhaustion_suppressed",
     "run",
     "save_state",
     "serialize_evidence",

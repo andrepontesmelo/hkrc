@@ -36,6 +36,21 @@
       "no_agent": true,
       "script": "harness-loop.py",
       "deliver": "local"
+    },
+    {
+      "name": "HKRC harness supervisor",
+      "schedule": "0 5 * * *",
+      "no_agent": false,
+      "deliver": "origin",
+      "skills": [
+        "kanban-operations",
+        "cron-automation",
+        "local-deployment",
+        "tts-with-me",
+        "hermes-agent",
+        "diagnosing-bugs"
+      ],
+      "prompt": "## Mission\nRead /home/example-user/.hermes/hkrc/config/hkrc/supervisor-mission.md and execute it verbatim as your full mission for this tick, including its Tick budget section. If the file is missing or unreadable, report 'blocked: mission file missing' and stop — do not improvise a mission.\n\n## Output contract\nLead with 'Done', 'In progress', 'Next'. State coverage explicitly: 'Harness layer' and 'Kanban execution layer'. Include real/probe/simulation labels. At most five bullets. Never say no action while high findings, evidence failures, undisposed proposals, routing failures, worker/controller errors, blockers, pending review/merge/tests/deploy remain. Give one under-two-minute next action, possibly 'No action from Andre; supervisor resumes tomorrow at 05:00.' Never speak IDs, hashes, paths, or internal references in TTS narrative; exact references may remain as compact text evidence. Deliver every tick, including blocked ticks."
     }
   ]
 }

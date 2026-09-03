@@ -36,6 +36,7 @@ EXPECTED_NAMES = {
     "kanban review gap watchdog",
     "hkrc archloop nightly",
     "harness-learning-loop (daily 7-day self-review)",
+    "HKRC harness supervisor",
 }
 
 
@@ -70,9 +71,26 @@ def job(
 
 
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the hermes cron store at a throwaway profile home."""
+    """Point the hermes cron store at a throwaway profile home.
+
+    Also scrubs cron-context session vars (HERMES_CRON_SESSION,
+    HERMES_CRON_AUTO_DELIVER_*, HERMES_SESSION_*) so the real CLI subprocess
+    sees the same environment in any caller context — otherwise a supervisor
+    session's auto-deliver context would resolve a literal ``--deliver origin``
+    into ``platform:chat_id`` at create time and break idempotence.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    for var in (
+        "HERMES_CRON_SESSION",
+        "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+        "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+        "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
 
 def store_path(tmp_path: Path) -> Path:
@@ -122,6 +140,76 @@ def test_shipped_manifest_declares_all_expected_jobs() -> None:
     assert harness.deliver == "local"
     assert harness.skills == ()
     assert harness.prompt is None
+
+
+def test_shipped_manifest_manages_harness_supervisor() -> None:
+    """The supervisor of the supervisors must be manifest-managed: a pause
+    wave that hits it has to be repairable by `hkrc crons sync` alone (it
+    went dark for 14 days in 2026-08 precisely because it was not listed)."""
+    supervisor = {j.name: j for j in manifest_jobs()}["HKRC harness supervisor"]
+    assert supervisor.no_agent is False
+    assert supervisor.script is None
+    assert supervisor.deliver == "origin"
+    assert supervisor.skills == (
+        "kanban-operations",
+        "cron-automation",
+        "local-deployment",
+        "tts-with-me",
+        "hermes-agent",
+        "diagnosing-bugs",
+    )
+    # Prompt is seeded at create time only and never diffed; a from-scratch
+    # recreate must yield a working job, so the manifest has to carry one.
+    assert supervisor.prompt is not None
+    assert "supervisor-mission.md" in supervisor.prompt
+    # DEF-001: cron agents run with a profile-scoped $HOME, so a tilde
+    # mission path expands to a nonexistent file and the prompt's own
+    # failure branch fires on every tick. The path must be absolute.
+    assert "~/.hermes" not in supervisor.prompt
+    assert (
+        "/home/example-user/.hermes/hkrc/config/hkrc/supervisor-mission.md"
+        in supervisor.prompt
+    )
+    # DEF-002: the mission file is the source of truth and says 05:00
+    # (schedule moved from noon on 2026-08-15); stale wording must not
+    # re-enter via the manifest.
+    assert "05:00" in supervisor.prompt
+    assert "noon" not in supervisor.prompt
+
+
+def test_plan_is_silent_for_converged_harness_supervisor() -> None:
+    """The manifest entry must match the live supervisor job field-for-field
+    on everything plan_sync diffs, or the next sync rewrites a healthy job.
+    The schedule derives from the manifest (times are never pinned by tests);
+    the remaining fields mirror the live record verbatim. The other manifest
+    jobs are present and converged, isolating the supervisor assertion."""
+    manifest = manifest_jobs()
+    supervisor = {j.name: j for j in manifest}["HKRC harness supervisor"]
+    live = [
+        job(
+            "1369f0027b78",
+            "HKRC harness supervisor",
+            schedule=supervisor.schedule,
+            no_agent=False,
+            script=None,
+            deliver="origin",
+            skills=list(supervisor.skills),
+        )
+    ]
+    live += [
+        job(
+            f"conv{i}",
+            j.name,
+            schedule=j.schedule,
+            no_agent=j.no_agent,
+            script=j.script,
+            deliver=j.deliver,
+            skills=list(j.skills),
+        )
+        for i, j in enumerate(manifest)
+        if j.name != "HKRC harness supervisor"
+    ]
+    assert plan_sync(manifest, live) == []
 
 
 def test_manifest_rejects_missing_name_or_schedule(tmp_path: Path) -> None:
@@ -190,7 +278,7 @@ def test_store_path_falls_back_to_default_home(tmp_path: Path, monkeypatch: pyte
 
 def test_plan_empty_store_creates_every_manifest_job() -> None:
     actions = plan_sync(manifest_jobs(), [])
-    assert [action.kind for action in actions] == ["create"] * 5
+    assert [action.kind for action in actions] == ["create"] * 6
     assert {action.job.name for action in actions} == EXPECTED_NAMES
 
 
@@ -205,13 +293,22 @@ def test_plan_is_silent_when_live_matches_manifest() -> None:
     stale = job("e", "kanban stale block watch", schedule=manifest["kanban stale block watch"].schedule, script="stale-block-watch.py")
     harness = job("c", "harness-learning-loop (daily 7-day self-review)", schedule=manifest["harness-learning-loop (daily 7-day self-review)"].schedule, no_agent=True, script="harness-loop.py")
     archloop = job("d", "hkrc archloop nightly", schedule=manifest["hkrc archloop nightly"].schedule, script="archloop-night-cron.sh")
-    assert plan_sync(manifest_jobs(), [live[0], live[1], stale, harness, archloop]) == []
+    supervisor = job(
+        "f",
+        "HKRC harness supervisor",
+        schedule=manifest["HKRC harness supervisor"].schedule,
+        no_agent=False,
+        script=None,
+        deliver="origin",
+        skills=["kanban-operations", "cron-automation", "local-deployment", "tts-with-me", "hermes-agent", "diagnosing-bugs"],
+    )
+    assert plan_sync(manifest_jobs(), [live[0], live[1], stale, harness, archloop, supervisor]) == []
 
 
 def test_plan_resumes_paused_job() -> None:
     paused = job("paused1", "kanban needs input watcher", enabled=False)
     actions = plan_sync(manifest_jobs(), [paused])
-    assert len(actions) == 5
+    assert len(actions) == 6
     resume = next(action for action in actions if action.kind == "resume")
     assert resume.job_id == "paused1"
     assert resume.job.name == "kanban needs input watcher"
@@ -258,7 +355,7 @@ def test_plan_never_touches_unlisted_jobs() -> None:
     ]
     actions = plan_sync(manifest_jobs(), live)
     assert all(action.job.name in EXPECTED_NAMES for action in actions)
-    assert len(actions) == 5  # all manifest jobs missing -> creates only
+    assert len(actions) == 6  # all manifest jobs missing -> creates only
 
 
 def test_plan_raises_on_ambiguous_name_match() -> None:
@@ -290,7 +387,7 @@ def test_dry_run_reports_without_writing(tmp_path: Path, monkeypatch: pytest.Mon
     out = capsys.readouterr().out
     assert "create" in out and "update" in out
     assert store_path(tmp_path).read_bytes() == before  # nothing mutated
-    assert len(actions) == 5  # 1 update + 4 creates
+    assert len(actions) == 6  # 1 update + 5 creates
 
 
 def test_run_sync_end_to_end_and_idempotence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -300,9 +397,9 @@ def test_run_sync_end_to_end_and_idempotence(tmp_path: Path, monkeypatch: pytest
     isolated_env(tmp_path, monkeypatch)
     config = ControllerConfig("test", tmp_path / "boards", tmp_path / "state.sqlite3", native_cli=hermes)
 
-    # Fresh run: empty store -> all five manifest jobs created.
+    # Fresh run: empty store -> all six manifest jobs created.
     actions = run_sync(config, MANIFEST)
-    assert [action.kind for action in actions] == ["create"] * 5
+    assert [action.kind for action in actions] == ["create"] * 6
     live = read_store(tmp_path)
     assert {job["name"] for job in live} == EXPECTED_NAMES
     blocker = next(job for job in live if job["name"] == "kanban needs input watcher")
@@ -315,6 +412,12 @@ def test_run_sync_end_to_end_and_idempotence(tmp_path: Path, monkeypatch: pytest
     # Shipped schedule is applied as-is (time itself is not pinned by tests).
     manifest_harness = next(j for j in manifest_jobs() if j.name.startswith("harness-learning-loop"))
     assert harness["schedule_display"] == manifest_harness.schedule
+    # Regression: `--deliver origin` must be stored verbatim. Without the
+    # sync's scrubbed subprocess env, a cron-context caller resolves it to the
+    # auto-deliver target at create time (telegram:-1004433470689), so every
+    # later sync plans a flip-flopping update.
+    supervisor = next(job for job in live if job["name"] == "HKRC harness supervisor")
+    assert supervisor["deliver"] == "origin"
 
     # Re-run: silent, zero diff.
     capsys.readouterr()

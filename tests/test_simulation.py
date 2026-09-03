@@ -317,6 +317,15 @@ def make_config(
             external_dirs=(str(tmp_path / "dist"),),
             hkrc_repo=hkrc_repo or (tmp_path / "repo"),
             analysis_profile=analysis_profile,
+            # Pin the sweep input hermetically (t_ae960b7d): unset would fall
+            # back to the live instance default / HKRC_PROFILES_ROOT and leak
+            # real config-drift findings into the shadow run.
+            profiles_root=str(profiles),
+            # Same hermetic pin for the archloop skip-streak sweep
+            # (t_ba4092e4): the default resolves to the live cron output
+            # dir and would leak real campcli/ynab-pilot findings into the
+            # simulation.  A nonexistent dir yields zero findings.
+            archloop_output_dir=str(tmp_path / "archloop-output"),
         ),
         watcher=WatcherConfig(reviewer_profiles=("reviewer",)),
     )

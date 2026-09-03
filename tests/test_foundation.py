@@ -14,6 +14,7 @@ from hkrc.config import (
     load_config,
     write_config,
 )
+from hkrc.harness_loop import HarnessLoopConfig
 from hkrc.state import ControllerState, StateError
 
 
@@ -134,9 +135,9 @@ def test_stream_config_rejects_enabled_mode_without_approved_wiring() -> None:
         ("ws://localhost/events", True),
         ("ws://[::1]/events", True),
         ("wss://dashboard.example.test/events", True),
-        ("wss://100.64.12.34/events", True),
+        ("wss://203.0.113.5/events", True),
         ("ws://dashboard.example.test/events", False),
-        ("ws://100.64.12.34/events", False),
+        ("ws://203.0.113.5/events", False),
     ],
 )
 def test_stream_endpoint_allows_plain_websocket_only_on_loopback(
@@ -414,6 +415,59 @@ def test_harness_loop_analysis_max_attempts_round_trips(tmp_path: Path) -> None:
 
     assert "analysis_max_attempts = 2" in path.read_text()
     assert load_config(path) == config
+
+
+def test_harness_loop_dist_skills_root_round_trips(tmp_path: Path) -> None:
+    # t_3de7f74e: the pin sweep's dist root is config-driven, never
+    # hardcoded; default and custom values must survive a write/load cycle.
+    config = ControllerConfig(
+        instance_name="work-a",
+        native_boards_root=tmp_path / "native-boards",
+        state_db=tmp_path / "controller.sqlite3",
+    )
+    path = tmp_path / "config.toml"
+    write_config(path, config)
+    text = path.read_text()
+    assert "dist_skills_root = " in text
+    assert load_config(path) == config  # default survives round-trip
+
+    config = ControllerConfig(
+        instance_name="work-a",
+        native_boards_root=tmp_path / "native-boards",
+        state_db=tmp_path / "controller.sqlite3",
+        harness_loop=HarnessLoopConfig(dist_skills_root=str(tmp_path / "custom-dist")),
+    )
+    write_config(path, config, overwrite=True)
+    assert f'dist_skills_root = "{tmp_path / "custom-dist"}"' in path.read_text()
+    assert load_config(path) == config  # custom value survives round-trip
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    ['dist_skills_root = ""', "dist_skills_root = 3"],
+)
+def test_harness_loop_config_rejects_bad_dist_skills_root(
+    tmp_path: Path, fragment: str
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f"""format_version = 1
+
+[instance]
+name = "work-a"
+native_boards_root = "/tmp/hermes/kanban/boards"
+
+[controller]
+state_db = "/tmp/hermes/state/hkrc/state.sqlite3"
+
+[harness_loop]
+{fragment}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="dist_skills_root"):
+        load_config(path)
 
 
 @pytest.mark.parametrize(

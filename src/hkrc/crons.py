@@ -21,7 +21,7 @@ The sync prints one line per planned action and is silent when in sync.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import json
 import os
@@ -274,6 +274,44 @@ def _cron_command(config: ControllerConfig) -> list[str]:
     return command + ["cron"]
 
 
+# Environment variables that must never reach the native `hermes cron`
+# subprocess. The cron gateway runs sync inside a cron-context session that
+# exports HERMES_CRON_SESSION=1 plus HERMES_CRON_AUTO_DELIVER_* (its own
+# delivery target); `get_session_env` falls back to os.environ, so the CLI
+# create path would rewrite a literal `--deliver origin` into the concrete
+# `platform:chat_id` of the creating run (`_resolve_cron_context_deliver`)
+# and capture a bogus origin from HERMES_SESSION_* (`_origin_from_env`).
+# The stored deliver then disagrees with the manifest and every subsequent
+# sync plans a flip-flopping update. Same boundary-scrub pattern as
+# review_gap.build_native_environment and admission.scrubbed_env.
+_CRON_ENV_STRIP_EXACT = (
+    "HERMES_CRON_SESSION",
+    "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+    "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+    "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_THREAD_ID",
+)
+
+
+def cron_subprocess_environment(
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return the ambient environment without cron-context delivery state.
+
+    The `hermes cron` CLI stores ``--deliver`` verbatim only when the create
+    path cannot see cron-context session variables, so `run_sync` mutates the
+    live store exactly as the manifest declares regardless of the caller's
+    ambient environment (live sync runs inside the cron gateway, where these
+    are always set).
+    """
+    env = dict(os.environ if base is None else base)
+    for key in _CRON_ENV_STRIP_EXACT:
+        env.pop(key, None)
+    return env
+
+
 def _create_args(job: ManifestJob) -> list[str]:
     args: list[str] = [job.schedule]
     if job.prompt:
@@ -323,7 +361,9 @@ def run_sync(
 
     Prints one ``crons sync: ...`` line per planned action and is silent when
     in sync.  With ``dry_run=True`` nothing is mutated.  ``runner`` exists for
-    deterministic tests and defaults to ``subprocess.run``.
+    deterministic tests and defaults to ``subprocess.run``. Subprocesses get
+    ``cron_subprocess_environment()`` so the CLI stores manifest literals
+    verbatim regardless of the caller's cron-context ambient environment.
     """
 
     manifest = load_manifest(manifest_path)
@@ -338,7 +378,12 @@ def run_sync(
         command = _action_command(action, config, by_id.get(action.job_id or "", {}))
         if runner is None:
             completed = subprocess.run(
-                command, capture_output=True, text=True, check=False, timeout=120
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+                env=cron_subprocess_environment(),
             )
             if completed.returncode != 0:
                 detail = (completed.stderr or completed.stdout or "").strip()

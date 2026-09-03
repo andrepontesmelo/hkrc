@@ -16,7 +16,17 @@ import re
 import tomllib
 from urllib.parse import urlsplit
 
-from .harness_loop import HarnessLoopConfig
+from .harness_loop import (
+    ACTIONABLE_SKIP_CLASSES,
+    ARCHLOOP_HIGH_NIGHTS,
+    ARCHLOOP_MEDIUM_NIGHTS,
+    DEFAULT_ARCHLOOP_OUTPUT_DIR,
+    DECISION_LATENCY_HUMAN_SECONDS,
+    DECISION_LATENCY_SECONDS,
+    DEFAULT_DIST_SKILLS_ROOT,
+    DEFAULT_PROFILES_ROOT,
+    HarnessLoopConfig,
+)
 
 
 class ConfigError(ValueError):
@@ -580,10 +590,22 @@ class ControllerConfig:
             f"bloat_top_n = {self.harness_loop.bloat_top_n}\n"
             f"sessions_db = {_toml_optional_string(str(self.harness_loop.sessions_db) if self.harness_loop.sessions_db else None)}\n"
             f"external_dirs = {_toml_string_array(self.harness_loop.external_dirs)}  # empty = git dist default\n"
+            f"dist_skills_root = {_toml_string(self.harness_loop.dist_skills_root)}  # worker-profile skill dist (pin sweep reads it)\n"
+            f"profiles_root = {_toml_string(self.harness_loop.profiles_root)}  # empty = HKRC_PROFILES_ROOT env, else {DEFAULT_PROFILES_ROOT}\n"
+            f"config_drift_allowed_profiles = {_toml_string_array(self.harness_loop.config_drift_allowed_profiles)}  # deliberate model.default pins; empty = flag all divergence\n"
             f"hkrc_repo = {_toml_optional_string(str(self.harness_loop.hkrc_repo) if self.harness_loop.hkrc_repo else None)}\n"
             f"analysis_profile = {_toml_string(self.harness_loop.analysis_profile)}  # empty = authoritative analysis disabled\n"
             f"analysis_timeout_seconds = {self.harness_loop.analysis_timeout_seconds}\n"
             f"analysis_max_attempts = {self.harness_loop.analysis_max_attempts}\n"
+            f"escalate_after_nights = {self.harness_loop.escalate_after_nights}\n"
+            f"chronic_after_nights = {self.harness_loop.chronic_after_nights}\n"
+            f"stale_retention_days = {self.harness_loop.stale_retention_days}\n"
+            f"archloop_output_dir = {_toml_string(self.harness_loop.archloop_output_dir)}  # empty = HKRC_ARCHLOOP_OUTPUT_DIR env, else {DEFAULT_ARCHLOOP_OUTPUT_DIR} (enabled)\n"
+            f"archloop_actionable_classes = {_toml_string_array(self.harness_loop.archloop_actionable_classes)}  # skip classes that escalate\n"
+            f"archloop_medium_nights = {self.harness_loop.archloop_medium_nights}\n"
+            f"archloop_high_nights = {self.harness_loop.archloop_high_nights}\n"
+            f"decision_latency_seconds = {self.harness_loop.decision_latency_seconds}  # machine-blocked defect threshold\n"
+            f"decision_latency_human_seconds = {self.harness_loop.decision_latency_human_seconds}  # needs_input waits on Andre; default 7d\n"
             "\n[assist]\n"
             f"human_in_loop = {'true' if self.assist.human_in_loop else 'false'}\n"
             "\n[outcome_guard]\n"
@@ -798,10 +820,38 @@ def load_config(path: Path) -> ControllerConfig:
     harness_loop_bloat_top_n = harness_loop.get("bloat_top_n", 3)
     harness_loop_sessions_db = harness_loop.get("sessions_db")
     harness_loop_external_dirs = harness_loop.get("external_dirs", [])
+    harness_loop_dist_skills_root = harness_loop.get(
+        "dist_skills_root", DEFAULT_DIST_SKILLS_ROOT
+    )
+    harness_loop_profiles_root = harness_loop.get("profiles_root", "")
+    harness_loop_config_drift_allowed = harness_loop.get(
+        "config_drift_allowed_profiles", []
+    )
     harness_loop_hkrc_repo = harness_loop.get("hkrc_repo")
     harness_loop_analysis_profile = harness_loop.get("analysis_profile", "")
     harness_loop_analysis_timeout = harness_loop.get("analysis_timeout_seconds", 120)
     harness_loop_analysis_max_attempts = harness_loop.get("analysis_max_attempts", 2)
+    harness_loop_escalate_after_nights = harness_loop.get("escalate_after_nights", 7)
+    harness_loop_chronic_after_nights = harness_loop.get("chronic_after_nights", 21)
+    harness_loop_stale_retention_days = harness_loop.get("stale_retention_days", 14)
+    harness_loop_archloop_output_dir = harness_loop.get(
+        "archloop_output_dir", DEFAULT_ARCHLOOP_OUTPUT_DIR
+    )
+    harness_loop_archloop_classes = harness_loop.get(
+        "archloop_actionable_classes", list(ACTIONABLE_SKIP_CLASSES)
+    )
+    harness_loop_archloop_medium = harness_loop.get(
+        "archloop_medium_nights", ARCHLOOP_MEDIUM_NIGHTS
+    )
+    harness_loop_archloop_high = harness_loop.get(
+        "archloop_high_nights", ARCHLOOP_HIGH_NIGHTS
+    )
+    harness_loop_decision_latency = harness_loop.get(
+        "decision_latency_seconds", DECISION_LATENCY_SECONDS
+    )
+    harness_loop_decision_latency_human = harness_loop.get(
+        "decision_latency_human_seconds", DECISION_LATENCY_HUMAN_SECONDS
+    )
     assist_human_in_loop = assist.get("human_in_loop", True)
     if not isinstance(assist_human_in_loop, bool):
         raise ConfigError("assist human_in_loop must be a boolean")
@@ -838,6 +888,24 @@ def load_config(path: Path) -> ControllerConfig:
         raise ConfigError("harness_loop external_dirs must be an array of non-empty strings")
     if len(set(harness_loop_external_dirs)) != len(harness_loop_external_dirs):
         raise ConfigError("harness_loop external_dirs must not contain duplicates")
+    if not isinstance(harness_loop_dist_skills_root, str) or not harness_loop_dist_skills_root.strip():
+        raise ConfigError("harness_loop dist_skills_root must be a non-empty string")
+    if not isinstance(harness_loop_profiles_root, str):
+        raise ConfigError("harness_loop profiles_root must be a string or empty")
+    if not isinstance(harness_loop_config_drift_allowed, list) or any(
+        not isinstance(profile, str) or not profile.strip()
+        for profile in harness_loop_config_drift_allowed
+    ):
+        raise ConfigError(
+            "harness_loop config_drift_allowed_profiles must be an array of "
+            "non-empty strings"
+        )
+    if len(set(harness_loop_config_drift_allowed)) != len(
+        harness_loop_config_drift_allowed
+    ):
+        raise ConfigError(
+            "harness_loop config_drift_allowed_profiles must not contain duplicates"
+        )
     if harness_loop_hkrc_repo is not None and not isinstance(harness_loop_hkrc_repo, str):
         raise ConfigError("harness_loop hkrc_repo must be a string or null")
     if not isinstance(harness_loop_analysis_profile, str):
@@ -854,6 +922,63 @@ def load_config(path: Path) -> ControllerConfig:
         or harness_loop_analysis_max_attempts <= 0
     ):
         raise ConfigError("harness_loop analysis_max_attempts must be a positive integer")
+    if (
+        not isinstance(harness_loop_escalate_after_nights, int)
+        or isinstance(harness_loop_escalate_after_nights, bool)
+        or harness_loop_escalate_after_nights <= 0
+    ):
+        raise ConfigError("harness_loop escalate_after_nights must be a positive integer")
+    if (
+        not isinstance(harness_loop_chronic_after_nights, int)
+        or isinstance(harness_loop_chronic_after_nights, bool)
+        or harness_loop_chronic_after_nights <= 0
+    ):
+        raise ConfigError("harness_loop chronic_after_nights must be a positive integer")
+    if harness_loop_chronic_after_nights < harness_loop_escalate_after_nights:
+        raise ConfigError(
+            "harness_loop chronic_after_nights must be >= escalate_after_nights"
+        )
+    if (
+        not isinstance(harness_loop_stale_retention_days, int)
+        or isinstance(harness_loop_stale_retention_days, bool)
+        or harness_loop_stale_retention_days <= 0
+    ):
+        raise ConfigError("harness_loop stale_retention_days must be a positive integer")
+    if not isinstance(harness_loop_archloop_output_dir, str):
+        raise ConfigError("harness_loop archloop_output_dir must be a string or empty")
+    if not isinstance(harness_loop_archloop_classes, list) or any(
+        not isinstance(skip_class, str) or not skip_class.strip()
+        for skip_class in harness_loop_archloop_classes
+    ):
+        raise ConfigError(
+            "harness_loop archloop_actionable_classes must be an array of non-empty strings"
+        )
+    if len(set(harness_loop_archloop_classes)) != len(harness_loop_archloop_classes):
+        raise ConfigError(
+            "harness_loop archloop_actionable_classes must not contain duplicates"
+        )
+    if (
+        not isinstance(harness_loop_archloop_medium, int)
+        or isinstance(harness_loop_archloop_medium, bool)
+        or harness_loop_archloop_medium <= 0
+    ):
+        raise ConfigError("harness_loop archloop_medium_nights must be a positive integer")
+    if (
+        not isinstance(harness_loop_archloop_high, int)
+        or isinstance(harness_loop_archloop_high, bool)
+        or harness_loop_archloop_high < harness_loop_archloop_medium
+    ):
+        raise ConfigError(
+            "harness_loop archloop_high_nights must be an integer >= archloop_medium_nights"
+        )
+    if not _is_positive_number(harness_loop_decision_latency):
+        raise ConfigError(
+            "harness_loop decision_latency_seconds must be a positive number"
+        )
+    if not _is_positive_number(harness_loop_decision_latency_human):
+        raise ConfigError(
+            "harness_loop decision_latency_human_seconds must be a positive number"
+        )
     outcome_guard_protected_refs = outcome_guard.get(
         "protected_refs", ["refs/heads/main"]
     )
@@ -941,6 +1066,9 @@ def load_config(path: Path) -> ControllerConfig:
                 else None
             ),
             external_dirs=tuple(harness_loop_external_dirs),
+            dist_skills_root=harness_loop_dist_skills_root,
+            profiles_root=harness_loop_profiles_root,
+            config_drift_allowed_profiles=tuple(harness_loop_config_drift_allowed),
             hkrc_repo=(
                 Path(harness_loop_hkrc_repo).expanduser()
                 if harness_loop_hkrc_repo
@@ -949,6 +1077,15 @@ def load_config(path: Path) -> ControllerConfig:
             analysis_profile=harness_loop_analysis_profile,
             analysis_timeout_seconds=harness_loop_analysis_timeout,
             analysis_max_attempts=harness_loop_analysis_max_attempts,
+            escalate_after_nights=harness_loop_escalate_after_nights,
+            chronic_after_nights=harness_loop_chronic_after_nights,
+            stale_retention_days=harness_loop_stale_retention_days,
+            archloop_output_dir=harness_loop_archloop_output_dir,
+            archloop_actionable_classes=tuple(harness_loop_archloop_classes),
+            archloop_medium_nights=harness_loop_archloop_medium,
+            archloop_high_nights=harness_loop_archloop_high,
+            decision_latency_seconds=harness_loop_decision_latency,
+            decision_latency_human_seconds=harness_loop_decision_latency_human,
         ),
         assist=AssistConfig(human_in_loop=assist_human_in_loop),
         outcome_guard=OutcomeGuardConfig(

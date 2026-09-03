@@ -24,11 +24,16 @@ from hkrc.harness_loop import (
     ProcessResult,
     ProcessRunner,
     SessionRow,
+    TaskRow,
+    DEFAULT_PROFILES_ROOT,
     _analyzer_command,
     _apply_candidates,
+    _detect_all,
     _next_action,
     _open_board_snapshot,
     _parse_analysis_json,
+    _profiles_root,
+    _upsert_open_finding,
     analyze_candidates,
     apply_policy_gate,
     build_analysis_prompt,
@@ -44,6 +49,7 @@ from hkrc.harness_loop import (
     detect_review_pair_gap,
     detect_review_required_loop,
     detect_retry_exhaustion,
+    detect_unresolvable_skill_pin,
     fingerprint,
     git_log_since,
     load_state,
@@ -51,6 +57,7 @@ from hkrc.harness_loop import (
     rank_open_findings,
     render_report,
     revalidate_open_findings,
+    retry_exhaustion_suppressed,
     run,
     save_state,
     serialize_evidence,
@@ -169,7 +176,8 @@ def make_board(
             completed_at INTEGER,
             block_kind TEXT,
             workspace_kind TEXT,
-            branch_name TEXT
+            branch_name TEXT,
+            skills TEXT
         );
         CREATE TABLE task_events (
             id INTEGER PRIMARY KEY,
@@ -198,8 +206,8 @@ def make_board(
     for task in tasks:
         connection.execute(
             "INSERT INTO tasks(id, title, body, assignee, status, priority, created_at, "
-            "completed_at, block_kind, workspace_kind, branch_name) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "completed_at, block_kind, workspace_kind, branch_name, skills) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task["id"],
                 task.get("title", task["id"]),
@@ -212,6 +220,7 @@ def make_board(
                 task.get("block_kind"),
                 task.get("workspace_kind", "worktree"),
                 task.get("branch_name"),
+                task.get("skills"),
             ),
         )
     event_id = 1
@@ -279,6 +288,11 @@ def make_config(
     analysis_profile: str = "",
     analysis_timeout_seconds: int = 120,
     analysis_max_attempts: int = 2,
+    dist_skills_root: Path | None = None,
+    profiles_root: Path | str | None = None,
+    config_drift_allowed_profiles: tuple[str, ...] = (),
+    decision_latency_seconds: int = 1800,
+    decision_latency_human_seconds: int = 7 * 86400,
 ) -> ControllerConfig:
     profiles = tmp_path / "profiles"
     return ControllerConfig(
@@ -296,6 +310,20 @@ def make_config(
             analysis_profile=analysis_profile,
             analysis_timeout_seconds=analysis_timeout_seconds,
             analysis_max_attempts=analysis_max_attempts,
+            dist_skills_root=str(dist_skills_root or (tmp_path / "dist")),
+            # Hermetic: the resolver falls back to the instance default
+            # (and HKRC_PROFILES_ROOT) when unset, which would leak the
+            # live ~/.hermes/profiles into tests.  Pin the fixture, unless
+            # the caller passes "" explicitly to exercise the auto path.
+            profiles_root=str(profiles) if profiles_root is None else str(profiles_root),
+            # Same hermetic pin for the archloop skip-streak sweep root
+            # (t_ba4092e4): the default resolves to the LIVE cron output
+            # dir and would leak real campcli/ynab-pilot findings into
+            # every fixture run.  A nonexistent dir yields zero findings.
+            archloop_output_dir=str(tmp_path / "archloop-output"),
+            config_drift_allowed_profiles=config_drift_allowed_profiles,
+            decision_latency_seconds=decision_latency_seconds,
+            decision_latency_human_seconds=decision_latency_human_seconds,
         ),
         watcher=WatcherConfig(reviewer_profiles=reviewer_profiles),
     )
@@ -494,10 +522,12 @@ def make_ticket_runner(
 
 def loop_board(
     *,
-    blocked_rows: tuple[tuple[str, str, int, str], ...] = (),
+    blocked_rows: tuple[tuple[str, str, int, str, str | None], ...] = (),
     failure_events: tuple[FailureEvent, ...] = (),
     children: Mapping[str, tuple[ChildInfo, ...]] | None = None,
     slug: str = "hkrc",
+    open_task_rows: tuple[TaskRow, ...] = (),
+    status_counts: tuple[tuple[str, int], ...] = (),
 ) -> BoardEvidence:
     """Hand-built board snapshot for the review-required-loop detector.
 
@@ -506,15 +536,21 @@ def loop_board(
     only maps children of DONE parents while ``blocked_rows`` only carries
     currently-BLOCKED tasks, so the loop's intended evidence (a blocked parent
     with impl children) is unreachable through the real collection path.
+
+    ``open_task_rows``/``status_counts`` mirror the real collector's
+    window-independent open-task sweep; both default to empty (no status
+    evidence), which the retry-exhaustion detector must treat as
+    fail-toward-reporting.
     """
     return BoardEvidence(
         slug=slug,
-        status_counts=(),
+        status_counts=status_counts,
         tasks_in_window=(),
         runs_in_window=(),
         failure_events=failure_events,
         children=dict(children or {}),
         blocked_rows=blocked_rows,
+        open_task_rows=open_task_rows,
     )
 
 
@@ -857,7 +893,9 @@ def test_run_bloat_live_transitions_to_ended_without_duplicate_open_entries(
         ),
         encoding="utf-8",
     )
-    run(config, now=NOW, dry_run=True)
+    # Queue-state transitions persist on LIVE runs only: dry-run is
+    # audit+report only and must leave the state file untouched.
+    run(config, now=NOW, dry_run=False)
     loaded = load_state(state_file)
     by_fp = {entry["fingerprint"]: entry for entry in loaded["open_findings"]}
     assert by_fp["bloat-live:s_x"]["fix_status"] == "stale"
@@ -2843,6 +2881,61 @@ def test_render_report_has_all_seven_sections() -> None:
     assert "[high]" not in text
 
 
+def test_render_report_decision_latency_human_gated_names_days() -> None:
+    """The human-gated decision-latency class renders in days, not '0 minutes'."""
+    human = Finding(
+        pattern="decision-latency",
+        key="wayfinder:needs_input",
+        severity="medium",
+        evidence=(
+            "3 human-gated task(s) awaiting Andre >7d on wayfinder "
+            "(t_aaaa1111, t_bbbb2222; oldest 18d) — decisions blocked on you, "
+            "not on automation",
+        ),
+        suggestion=(
+            "Andre: answer, delegate, or cancel these decisions — "
+            "no automation can clear a needs_input block"
+        ),
+        apply_kind="none",
+    )
+    report = HarnessReport(
+        story="window 24h: 1 finding",
+        wrong=(human,),
+        skipped=(),
+        applied=(),
+        deploy_ready="none",
+        right=(),
+        next_action="Nothing to do.",
+    )
+    text = render_report(report)
+    assert "Problem: Decisions have been awaiting the operator for more than 7 days." in text
+    assert "0 minutes" not in text
+    # Machine class keeps the minutes prose.
+    machine = Finding(
+        pattern="decision-latency",
+        key="hkrc",
+        severity="medium",
+        evidence=(
+            "2 machine-blocked task(s) stuck >30min on hkrc "
+            "(t_cccc3333; oldest 1h) — workers not deciding",
+        ),
+        suggestion="check the stuck workers' block reasons",
+        apply_kind="none",
+    )
+    mixed = HarnessReport(
+        story="window 24h: 2 findings",
+        wrong=(machine, human),
+        skipped=(),
+        applied=(),
+        deploy_ready="none",
+        right=(),
+        next_action="Nothing to do.",
+    )
+    mixed_text = render_report(mixed)
+    assert "blocked for more than 30 minutes" in mixed_text
+    assert "awaiting the operator for more than 7 days" in mixed_text
+
+
 def test_render_report_groups_same_pattern_with_count() -> None:
     """AC3: repeated same-pattern findings collapse into one numbered section."""
     def bloat_ended(key, tokens):
@@ -3550,6 +3643,99 @@ def test_detect_reask_skips_status_and_use_tts_probes() -> None:
     assert detect_reask(probe_sessions) == ()
 
 
+def test_detect_reask_skips_probe_sentinel_first_messages() -> None:
+    """Regression (2026-09-02, kanban t_3b7d3944): scripted liveness probes
+    ('Reply with exactly: PROBE_OK') recur identically across unrelated
+    sessions weeks apart.  They are infrastructure checks, not a repeated
+    human question, so they must never form a reask finding — the live
+    fingerprint reask:2674a1beb7f1 fired a HIGH on two PROBE_OK probes with
+    21,709 combined input tokens.
+    """
+    probe_messages = (
+        "Reply with exactly: PROBE_OK",
+        "Reply with exactly: DIRECT_OK",
+        "PROBE",
+        "PING",
+        "PONG",
+        "pong",
+        "probe-ok",
+        "reply with exactly PONG",
+        # Variants observed in the same live 24h window (t_3b7d3944):
+        "Say exactly: PROBE_OK",
+        "Say exactly: PRO_OK",
+        "Reply exactly FALLBACK_PROBE_OK",
+        "PRO_OK2",
+        "respond with exactly: sentinel_ok",
+    )
+    for message in probe_messages:
+        pair = [
+            session_row(
+                "20260813_092655_0de03f",
+                started_at=NOW - 100,
+                input_tokens=10_000,
+                first_message=message,
+            ),
+            session_row(
+                "20260901_160608_91ef85",
+                started_at=NOW - 90,
+                input_tokens=11_000,
+                first_message=message,
+            ),
+        ]
+        assert detect_reask(pair) == (), message
+
+
+def test_detect_reask_still_flags_real_questions_resembling_probes() -> None:
+    """The sentinel exclusion must not blanket-mute: a real repeated first
+    question still yields the high finding, even one that merely CONTAINS a
+    sentinel word (shape/length-capped, not substring-matched).
+    """
+    ping_question = "Is the PING endpoint down again?"
+    ping_pair = [
+        session_row("s_ping_q_a", started_at=NOW - 100, first_message=ping_question),
+        session_row("s_ping_q_b", started_at=NOW - 90, first_message=ping_question),
+    ]
+    findings = detect_reask(ping_pair)
+    assert len(findings) == 1
+    assert findings[0].pattern == "reask"
+    assert findings[0].severity == "high"
+
+    migration_question = (
+        "Why did the GLM migration drop the zai/glm-5.3 pro id from the "
+        "persona tier map, and what is the correct override?"
+    )
+    migration_pair = [
+        session_row("s_glm_a", started_at=NOW - 80, first_message=migration_question),
+        session_row("s_glm_b", started_at=NOW - 70, first_message=migration_question),
+    ]
+    findings = detect_reask(migration_pair)
+    assert len(findings) == 1
+    assert findings[0].pattern == "reask"
+    assert findings[0].severity == "high"
+    assert "2 fresh sessions" in findings[0].evidence[0]
+
+
+def test_run_fail_safe_when_sessions_db_missing_or_empty(tmp_path: Path) -> None:
+    """AC 3 (t_3b7d3944): a nonexistent or empty session store yields zero
+    reask findings and never raises — the run degrades to a fail-closed
+    note instead of crashing the loop.
+    """
+    # Nonexistent DB: make_config's default sessions_db is never created.
+    config = make_config(tmp_path)
+    state_file = tmp_path / "state" / "scratch" / "harness-loop-state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    text = run(config, now=NOW, dry_run=True, state_path=state_file)
+    assert isinstance(text, str)
+    assert "Repeated first questions" not in text
+    # Empty DB: exists, zero sessions — same fail-safe outcome.
+    empty_db = make_sessions_db(tmp_path / "empty" / "state.db", [])
+    config_empty = make_config(tmp_path, sessions_db=empty_db)
+    text_empty = run(config_empty, now=NOW, dry_run=True, state_path=state_file)
+    assert isinstance(text_empty, str)
+    assert "Repeated first questions" not in text_empty
+    assert detect_reask(()) == ()
+
+
 def test_detect_reask_still_flags_genuine_repeats_mixed_with_noise() -> None:
     """The exclusions never suppress a genuine repeated question: a real
     repeated first question still yields a high finding when cron sessions,
@@ -3727,8 +3913,8 @@ def test_detect_decision_latency_flags_tasks_blocked_past_threshold(
             {"id": "t_done", "title": "task: done", "status": "done", "created_at": NOW - 200},
         ],
         events={
-            "t_old": [("blocked", NOW - 3600, json.dumps({"reason": "needs input"}))],
-            "t_fresh": [("blocked", NOW - 100, json.dumps({"reason": "needs input"}))],
+            "t_old": [("blocked", NOW - 3600, json.dumps({"reason": "worker stalled on merge"}))],
+            "t_fresh": [("blocked", NOW - 100, json.dumps({"reason": "worker stalled on merge"}))],
         },
     )
     boards = collect_boards(root, now=NOW, window_hours=24)
@@ -3743,6 +3929,170 @@ def test_detect_decision_latency_flags_tasks_blocked_past_threshold(
     tightened = detect_decision_latency(boards, now=NOW, threshold_seconds=60)
     assert len(tightened) == 1
     assert "t_fresh" in tightened[0].evidence[0]
+
+
+def test_detect_decision_latency_needs_input_awaits_human_not_machine_threshold(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "boards"
+    make_board(
+        root,
+        "wayfinder",
+        [
+            {
+                "id": "t_human",
+                "title": "wayfinder: retirement direction",
+                "status": "blocked",
+                "created_at": NOW - 200,
+                "block_kind": "needs_input",
+            },
+        ],
+        events={
+            "t_human": [
+                (
+                    "blocked",
+                    NOW - 18 * 86400,
+                    json.dumps(
+                        {"reason": "Human gate: need CRA numbers", "kind": "needs_input"}
+                    ),
+                )
+            ],
+        },
+    )
+    boards = collect_boards(root, now=NOW, window_hours=24)
+    # A card waiting on Andre is NOT a 30-minute defect: with the human
+    # threshold disabled, 18 days of needs_input stays silent — the
+    # machine rule never judges it.
+    assert (
+        detect_decision_latency(boards, now=NOW, human_threshold_seconds=10**12)
+        == ()
+    )
+    # At the human threshold the rotting decision surfaces exactly once,
+    # as its own class, with evidence that names it.
+    findings = detect_decision_latency(
+        boards, now=NOW, human_threshold_seconds=7 * 86400
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.pattern == "decision-latency"
+    assert finding.key == "wayfinder:needs_input"
+    assert finding.severity == "medium"
+    assert finding.apply_kind == "none"
+    assert "human-gated" in finding.evidence[0]
+    assert "awaiting Andre" in finding.evidence[0]
+    assert "t_human" in finding.evidence[0]
+    assert "oldest 18d" in finding.evidence[0]
+    assert "Andre" in finding.suggestion
+
+
+def test_detect_decision_latency_machine_block_keeps_30min_threshold(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "boards"
+    make_board(
+        root,
+        "hkrc",
+        [
+            # block_kind NULL and no blocked-event kind: machine class.
+            {"id": "t_stuck", "title": "task: stuck", "status": "blocked", "created_at": NOW - 200},
+            # needs_input at 31min: NOT a machine finding.
+            {"id": "t_ask", "title": "task: ask", "status": "blocked", "created_at": NOW - 200, "block_kind": "needs_input"},
+        ],
+        events={
+            "t_stuck": [("blocked", NOW - 1900, json.dumps({"reason": "worker stalled"}))],
+            "t_ask": [("blocked", NOW - 1900, json.dumps({"reason": "need Andre", "kind": "needs_input"}))],
+        },
+    )
+    boards = collect_boards(root, now=NOW, window_hours=24)
+    findings = detect_decision_latency(boards, now=NOW)
+    assert len(findings) == 1
+    assert findings[0].pattern == "decision-latency"
+    assert findings[0].key == "hkrc"
+    assert "machine-blocked" in findings[0].evidence[0]
+    assert "t_stuck" in findings[0].evidence[0]
+    assert "t_ask" not in findings[0].evidence[0]
+
+
+def test_detect_decision_latency_block_kind_fallback_ladder(tmp_path: Path) -> None:
+    root = tmp_path / "boards"
+    make_board(
+        root,
+        "hkrc",
+        [
+            # Typed column wins over the event payload kind.
+            {"id": "t_typed", "title": "task: typed", "status": "blocked", "created_at": NOW - 200, "block_kind": "needs_input"},
+            # Column NULL: the blocked event payload's kind classifies.
+            {"id": "t_payload", "title": "task: payload", "status": "blocked", "created_at": NOW - 200},
+            # Neither available: fail toward REPORTING (machine class).
+            {"id": "t_unknown", "title": "task: unknown", "status": "blocked", "created_at": NOW - 200},
+            # Legacy row: no column, no payload kind — the reason text classifies.
+            {"id": "t_legacy", "title": "task: legacy", "status": "blocked", "created_at": NOW - 200},
+        ],
+        events={
+            "t_typed": [("blocked", NOW - 18 * 86400, json.dumps({"reason": "r", "kind": "worker_stall"}))],
+            "t_payload": [("blocked", NOW - 18 * 86400, json.dumps({"reason": "r", "kind": "needs_input"}))],
+            "t_unknown": [("blocked", NOW - 1900, json.dumps({"reason": "stalled"}))],
+            "t_legacy": [("blocked", NOW - 18 * 86400, json.dumps({"reason": "waiting for Andre, he needs input here"}))],
+        },
+    )
+    boards = collect_boards(root, now=NOW, window_hours=24)
+    findings = detect_decision_latency(boards, now=NOW)
+    by_key = {finding.key: finding for finding in findings}
+    # Typed needs_input column beats the payload kind: human class.
+    assert "hkrc:needs_input" in by_key
+    assert "t_typed" in by_key["hkrc:needs_input"].evidence[0]
+    assert "t_payload" in by_key["hkrc:needs_input"].evidence[0]
+    assert "t_legacy" in by_key["hkrc:needs_input"].evidence[0]
+    assert "t_unknown" not in by_key["hkrc:needs_input"].evidence[0]
+    # Both unavailable: machine class at the 30min threshold (reported).
+    assert "hkrc" in by_key
+    assert "t_unknown" in by_key["hkrc"].evidence[0]
+
+
+def test_detect_all_wires_decision_latency_thresholds_from_config(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "boards"
+    make_board(
+        root,
+        "hkrc",
+        [{"id": "t_stuck", "title": "task: stuck", "status": "blocked", "created_at": NOW - 200}],
+        events={"t_stuck": [("blocked", NOW - 2400, json.dumps({"reason": "stalled"}))]},
+    )
+    boards = collect_boards(root, now=NOW, window_hours=24)
+    # Default 1800s machine threshold: the 40min stall is reported.
+    default_findings = _detect_all((), boards, "", NOW, make_config(tmp_path))
+    assert any(f.pattern == "decision-latency" for f in default_findings)
+    # The config knob flows through: raising it silences the same board.
+    raised_findings = _detect_all(
+        (), boards, "", NOW, make_config(tmp_path, decision_latency_seconds=4000)
+    )
+    assert not any(f.pattern == "decision-latency" for f in raised_findings)
+
+
+def test_harness_loop_decision_latency_config_roundtrip(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    assert config.harness_loop.decision_latency_seconds == 1800
+    assert config.harness_loop.decision_latency_human_seconds == 7 * 86400
+    path = tmp_path / "config.toml"
+    write_config(path, config, overwrite=True)
+    loaded = load_config(path)
+    assert loaded.harness_loop.decision_latency_seconds == 1800
+    assert loaded.harness_loop.decision_latency_human_seconds == 7 * 86400
+    text = path.read_text(encoding="utf-8")
+    assert "decision_latency_seconds = 1800" in text
+    assert "decision_latency_human_seconds = 604800" in text
+
+
+def test_harness_loop_decision_latency_config_validation_raises() -> None:
+    with pytest.raises(HarnessLoopError):
+        HarnessLoopConfig(decision_latency_seconds=0)
+    with pytest.raises(HarnessLoopError):
+        HarnessLoopConfig(decision_latency_seconds=True)
+    with pytest.raises(HarnessLoopError):
+        HarnessLoopConfig(decision_latency_human_seconds=-1)
+    with pytest.raises(HarnessLoopError):
+        HarnessLoopConfig(decision_latency_human_seconds=True)
 
 
 # --- review-pair gap (assignee history) -------------------------------------
@@ -4011,7 +4361,7 @@ def test_skill_contradiction_flags_unquoted_instruction_not_doc_quote(
 
 def test_review_required_loop_located_nested_dist_skill(tmp_path: Path) -> None:
     board = loop_board(
-        blocked_rows=(("t_parent", "task: parent", NOW - 200, "review-required: needs a review child"),),
+        blocked_rows=(("t_parent", "task: parent", NOW - 200, "review-required: needs a review child", None),),
         failure_events=(
             FailureEvent("t_parent", "block_loop_detected", NOW - 300, None),
         ),
@@ -4039,7 +4389,7 @@ def test_review_required_loop_located_nested_dist_skill(tmp_path: Path) -> None:
 
 def test_review_required_loop_without_skill_is_report_only() -> None:
     board = loop_board(
-        blocked_rows=(("t_parent", "task: parent", NOW - 200, "review-required: needs a review child"),),
+        blocked_rows=(("t_parent", "task: parent", NOW - 200, "review-required: needs a review child", None),),
         failure_events=(
             FailureEvent("t_parent", "block_loop_detected", NOW - 300, None),
         ),
@@ -4057,7 +4407,7 @@ def test_review_required_loop_without_skill_is_report_only() -> None:
 
 def test_review_required_loop_requires_all_three_signals() -> None:
     loop_event = FailureEvent("t_parent", "block_loop_detected", NOW - 300, None)
-    blocked_row = ("t_parent", "task: parent", NOW - 200, "review-required: needs a review child")
+    blocked_row = ("t_parent", "task: parent", NOW - 200, "review-required: needs a review child", None)
     impl_children = {"t_parent": (ChildInfo("t_child", "impl: parent followup", None, ()),)}
     # Blocked with the review-required reason but no block-loop event: silent.
     assert detect_review_required_loop(
@@ -4067,7 +4417,7 @@ def test_review_required_loop_requires_all_three_signals() -> None:
     assert detect_review_required_loop(
         (
             loop_board(
-                blocked_rows=(("t_parent", "task: parent", NOW - 200, "needs input"),),
+                blocked_rows=(("t_parent", "task: parent", NOW - 200, "needs input", None),),
                 failure_events=(loop_event,),
                 children=impl_children,
             ),
@@ -4249,6 +4599,134 @@ def test_detect_retry_exhaustion_real_board_shape(tmp_path: Path) -> None:
     assert findings[0].apply_kind == "none"
 
 
+# --- retry-exhaustion terminal-status suppression (t_b905b49e) ---------------
+
+
+_TRIP_PAYLOAD = json.dumps(
+    {
+        "failures": 2,
+        "effective_limit": 2,
+        "limit_source": "dispatcher",
+        "trigger_outcome": "timed_out",
+    }
+)
+
+
+def _open_row(task_id: str, status: str = "blocked") -> TaskRow:
+    """One open-task row as the real collector emits it (window-independent)."""
+    return TaskRow(
+        id=task_id,
+        title=f"task: {task_id}",
+        status=status,
+        assignee=None,
+        created_at=NOW - 300,
+        completed_at=None,
+        block_kind=None,
+    )
+
+
+@pytest.mark.parametrize("terminal_status", ["done", "cancelled", "archived"])
+def test_detect_retry_exhaustion_terminal_card_not_escalated(terminal_status: str) -> None:
+    """t_b905b49e live defect (2026-09-01 report, 5/5 false HIGHs): a card
+    whose ``gave_up`` trip is in the window but whose CURRENT status is
+    terminal is a recovered card and must NOT escalate.  Suppression needs
+    positive status evidence from the same board snapshot: the card absent
+    from ``open_task_rows`` (every non-done/non-cancelled/non-archived row
+    regardless of window), or — when the board's open rows are empty —
+    ``status_counts`` proving the board holds zero open tasks."""
+    trip = FailureEvent("t_card", "gave_up", NOW - 100, _TRIP_PAYLOAD)
+    # Primary evidence path: another card is still open, t_card is not in
+    # the board's open rows.
+    board = loop_board(failure_events=(trip,), open_task_rows=(_open_row("t_other"),))
+    assert detect_retry_exhaustion((board,)) == ()
+    # Fallback evidence path: empty open rows + status_counts proving every
+    # task on the board sits in a terminal status.
+    solo = loop_board(failure_events=(trip,), status_counts=((terminal_status, 1),))
+    assert detect_retry_exhaustion((solo,)) == ()
+
+
+def test_detect_retry_exhaustion_open_card_still_escalates() -> None:
+    """The same trip on a card that is STILL dispatchable (present in
+    ``open_task_rows``) keeps producing exactly one HIGH finding routed to
+    senior-dev — suppression never swallows a live escalation."""
+    board = loop_board(
+        failure_events=(FailureEvent("t_card", "gave_up", NOW - 100, _TRIP_PAYLOAD),),
+        open_task_rows=(_open_row("t_card"),),
+        status_counts=(("blocked", 1),),
+    )
+    findings = detect_retry_exhaustion((board,))
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+    assert findings[0].key == "hkrc:t_card"
+    assert findings[0].route_to == "senior-dev"
+    assert findings[0].apply_kind == "none"
+
+
+def test_detect_retry_exhaustion_no_status_evidence_fails_toward_reporting() -> None:
+    """Empty ``open_task_rows`` with NO status evidence (hand-built snapshot,
+    non-native skip) must not suppress everything: without positive proof the
+    card is terminal, the finding still fires — a false positive is cheaper
+    than a missed real escalation."""
+    board = loop_board(
+        failure_events=(FailureEvent("t_card", "gave_up", NOW - 100, _TRIP_PAYLOAD),),
+    )
+    findings = detect_retry_exhaustion((board,))
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+    assert findings[0].key == "hkrc:t_card"
+
+
+def test_detect_retry_exhaustion_terminal_card_real_collector_path(tmp_path: Path) -> None:
+    """The real collector path: a DONE card with an in-window ``gave_up``
+    event is suppressed, and the suppression trace names the card."""
+    root = tmp_path / "boards"
+    make_board(
+        root,
+        "casa-gungalilin",
+        [
+            {
+                "id": "t_4135c346",
+                "title": "feat: finished work",
+                "status": "done",
+                "created_at": NOW - 300,
+                "completed_at": NOW - 200,
+            }
+        ],
+        events={"t_4135c346": [("gave_up", NOW - 100, _TRIP_PAYLOAD)]},
+    )
+    boards = collect_boards(root, now=NOW, window_hours=24)
+    assert detect_retry_exhaustion(boards) == ()
+    assert retry_exhaustion_suppressed(boards) == ("casa-gungalilin:t_4135c346",)
+
+
+def test_run_reports_suppressed_retry_exhaustion_in_story(tmp_path: Path) -> None:
+    """Suppressed cards leave a trace in the run summary: the story counts
+    them as suppressed-as-recovered and never claims they were escalated."""
+    root = tmp_path / "boards"
+    make_board(
+        root,
+        "hkrc",
+        [
+            {
+                "id": "t_card",
+                "title": "feat: thing",
+                "status": "done",
+                "created_at": NOW - 300,
+                "completed_at": NOW - 200,
+            }
+        ],
+        events={"t_card": [("gave_up", NOW - 100, _TRIP_PAYLOAD)]},
+    )
+    config = make_config(tmp_path, hkrc_repo=make_hkrc_repo(tmp_path))
+    report = run(config, now=NOW, dry_run=True)
+    # Census trace: evaluated AND suppressed counts — an all-suppressed run
+    # (the live 2026-09-01+ shape) is never indistinguishable from a
+    # broken detector.
+    assert "retry-exhaustion census: 1 candidate(s) evaluated" in report
+    assert "1 suppressed as already recovered (terminal status)" in report
+    assert "escalated to senior-dev" not in report
+
+
 def test_run_reports_retry_exhaustion_top_line(tmp_path: Path) -> None:
     """The report top line names the escalation: N retry-exhausted cards
     escalated to senior-dev."""
@@ -4396,6 +4874,231 @@ def test_detect_config_drift_aligned_or_missing_is_silent(tmp_path: Path) -> Non
     assert detect_config_drift(tmp_path / "missing") == ()
 
 
+def test_config_drift_allowlisted_profile_is_not_flagged(tmp_path: Path) -> None:
+    # t_48fcf459 defect B: a deliberate, declared pin must not be flagged,
+    # while any UNDECLARED divergence still is.  Empty allowlist = flag all
+    # divergence (pre-change behaviour, byte for byte).
+    profiles = tmp_path / "profiles"
+    for name, model in (
+        ("main", "model-a"),
+        ("worker", "model-b"),  # declared deliberate pin
+        ("frontend", "model-c"),  # NOT declared
+    ):
+        profile = profiles / name
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / "config.yaml").write_text(
+            f'model:\n  default: "{model}"\n', encoding="utf-8"
+        )
+    empty = detect_config_drift(profiles, allowed_profiles=())
+    assert len(empty) == 1
+    assert empty[0].key == "model.default"
+
+    allowed = detect_config_drift(profiles, allowed_profiles=("worker",))
+    assert len(allowed) == 1
+    assert "worker=model-b" not in allowed[0].evidence[0]
+    assert "frontend=model-c" in allowed[0].evidence[0]
+
+    fully_declared = detect_config_drift(
+        profiles, allowed_profiles=("worker", "frontend")
+    )
+    assert fully_declared == ()
+
+
+def test_config_drift_allowlist_wired_through_detect_all(tmp_path: Path) -> None:
+    # t_48fcf459 defect B: _detect_all must pass the config knob through, so
+    # a deliberate pin declared in config.toml stops reaching the ledger.
+    profiles = tmp_path / "profiles"
+    for name, model in (("main", "model-a"), ("worker", "model-b")):
+        profile = profiles / name
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / "config.yaml").write_text(
+            f'model:\n  default: "{model}"\n', encoding="utf-8"
+        )
+    base = make_config(tmp_path, profiles_root=profiles)
+    assert len(_detect_all((), (), "", 0, base)) >= 1
+
+    pinned = make_config(
+        tmp_path, profiles_root=profiles, config_drift_allowed_profiles=("worker",)
+    )
+    assert detect_config_drift(profiles, allowed_profiles=()) != ()
+    assert _detect_all((), (), "", 0, pinned) == ()
+
+
+def test_config_drift_allowlist_round_trips(tmp_path: Path) -> None:
+    config = ControllerConfig(
+        instance_name="work-a",
+        native_boards_root=tmp_path / "native-boards",
+        state_db=tmp_path / "controller.sqlite3",
+        harness_loop=HarnessLoopConfig(
+            config_drift_allowed_profiles=("worker", "frontend")
+        ),
+    )
+    path = tmp_path / "config.toml"
+    write_config(path, config)
+    assert 'config_drift_allowed_profiles = ["worker", "frontend"]' in path.read_text()
+    assert load_config(path) == config
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        'config_drift_allowed_profiles = "worker"',
+        'config_drift_allowed_profiles = ["worker", ""]',
+        'config_drift_allowed_profiles = ["worker", "worker"]',
+    ],
+)
+def test_config_drift_allowlist_rejects_bad_values(tmp_path: Path, fragment: str) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f"""format_version = 1
+
+[instance]
+name = "work-a"
+native_boards_root = "/tmp/hermes/kanban/boards"
+
+[controller]
+state_db = "/tmp/hermes/state/hkrc/state.sqlite3"
+
+[harness_loop]
+{fragment}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="config_drift_allowed_profiles"):
+        load_config(path)
+
+
+def test_upsert_refreshes_evidence_bearing_payload_on_recurrence() -> None:
+    # t_48fcf459 defect A: the stored evidence of a recurring finding was
+    # frozen at first_seen forever — a fixed detector (e.g. the _profiles_root
+    # bug) kept feeding stale evidence to the report and the analyzer.  The
+    # evidence-bearing payload must refresh from the fresh Finding while
+    # first_seen / occurrence_count / fingerprint stay untouched.
+    first = Finding(
+        pattern="config-drift",
+        key="model.default",
+        severity="low",
+        evidence=("stale backup-dir evidence",),
+        suggestion="old suggestion",
+    )
+    open_findings: list[dict] = []
+    queue_by_fp: dict[str, dict] = {}
+    e1 = _upsert_open_finding(open_findings, queue_by_fp, first, now=100, last_suggestion=None)
+    assert e1["first_seen"] == 100
+    assert e1["occurrence_count"] == 1
+
+    fresh = Finding(
+        pattern="config-drift",
+        key="model.default",
+        severity="medium",
+        evidence=("fresh 8-profile evidence",),
+        suggestion="new suggestion",
+        before="before-text",
+        after="after-text",
+        target_path="/tmp/target",
+        verify_path="/tmp/verify",
+        verify_text="verify-text",
+        match_subject="match-subject",
+    )
+    e2 = _upsert_open_finding(open_findings, queue_by_fp, fresh, now=200, last_suggestion=None)
+    assert e1 is e2
+    assert e2["first_seen"] == 100  # streak continuity
+    assert e2["occurrence_count"] == 2
+    assert e2["fingerprint"] == fingerprint(fresh)
+    assert list(e2["evidence"]) == ["fresh 8-profile evidence"]
+    assert e2["severity"] == "medium"
+    assert e2["suggestion"] == "new suggestion"
+    assert e2["before"] == "before-text"
+    assert e2["after"] == "after-text"
+    assert e2["target_path"] == "/tmp/target"
+    assert e2["verify_path"] == "/tmp/verify"
+    assert e2["verify_text"] == "verify-text"
+    assert e2["match_subject"] == "match-subject"
+
+
+def test_upsert_recurrence_reverts_cleared_optional_fields() -> None:
+    # The detector's verdict is authoritative: if the fresh Finding no longer
+    # carries before/after/verify data, the entry must not keep the stale
+    # fix payload from an older occurrence.
+    first = Finding(
+        pattern="fix-chain",
+        key="t_1",
+        severity="high",
+        evidence=("e",),
+        suggestion="s",
+        before="b",
+        after="a",
+        verify_text="v",
+    )
+    open_findings: list[dict] = []
+    queue_by_fp: dict[str, dict] = {}
+    _upsert_open_finding(open_findings, queue_by_fp, first, now=100, last_suggestion=None)
+    bare = Finding(pattern="fix-chain", key="t_1", severity="high", evidence=("e2",), suggestion="s2")
+    e2 = _upsert_open_finding(open_findings, queue_by_fp, bare, now=200, last_suggestion=None)
+    assert e2["before"] == ""
+    assert e2["after"] == ""
+    assert e2["verify_text"] == ""
+
+
+def test_upsert_recurrence_keeps_last_suggestion_without_fresh_one() -> None:
+    # last_suggestion is passed as None on cooldown-suppressed runs; a
+    # recurrence must not wipe the recorded suggestion date.
+    first = Finding(pattern="bloat", key="s1", severity="low", evidence=("e",), suggestion="s")
+    open_findings: list[dict] = []
+    queue_by_fp: dict[str, dict] = {}
+    _upsert_open_finding(
+        open_findings, queue_by_fp, first, now=100, last_suggestion=123
+    )
+    e2 = _upsert_open_finding(
+        open_findings, queue_by_fp, first, now=200, last_suggestion=None
+    )
+    assert e2["last_suggestion"] == 123
+
+
+# --- profiles root resolution (t_ae960b7d) ----------------------------------
+
+
+def test_profiles_root_flat_sessions_db_layout(tmp_path: Path) -> None:
+    """Regression: sessions DB at <root>/state.db (no main/ segment).
+
+    The old resolver returned sessions_db.parent.parent, which for the live
+    layout (~/.hermes/state.db) climbed to $HOME and sent the assignee sweep
+    hunting $HOME/<assignee> — 10 nightly false positives.  With the
+    fix, the flat layout resolves via the config knob regardless of where
+    the database sits.
+    """
+    config = make_config(
+        tmp_path,
+        sessions_db=tmp_path / "state.db",  # flat: no profiles/main/ segment
+        profiles_root=tmp_path / "real-profiles",
+    )
+    assert _profiles_root(config) == tmp_path / "real-profiles"
+
+
+def test_profiles_root_explicit_config_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path, profiles_root=tmp_path / "from-config")
+    monkeypatch.setenv("HKRC_PROFILES_ROOT", str(tmp_path / "from-env"))
+    assert _profiles_root(config) == tmp_path / "from-config"
+
+
+def test_profiles_root_env_fallback_survives_home_redirection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-08-15 persona_drift trap: inside a Hermes worker session $HOME
+    is profile-redirected, so a resolver built on Path.home() silently
+    reads the wrong tree (or an empty one) and reports 0 findings.  Auto
+    mode must reach the env override without touching $HOME.
+    """
+    config = make_config(tmp_path, profiles_root="")  # auto mode
+    monkeypatch.setenv("HKRC_PROFILES_ROOT", str(tmp_path / "env-profiles"))
+    monkeypatch.setenv("HOME", str(tmp_path / "redirected-home"))
+    (tmp_path / "redirected-home").mkdir()
+    assert _profiles_root(config) == tmp_path / "env-profiles"
+    assert Path.home() == tmp_path / "redirected-home"  # prove the trap was set
+
+
 # --- CLI --------------------------------------------------------------------
 
 
@@ -4422,7 +5125,9 @@ def test_cli_harness_loop_run_dry_run_smoke(tmp_path: Path, capsys) -> None:
     assert "Harness loop —" in captured.out
     assert "What's wrong (orchestration layer)" in captured.out
     assert "Deploy-ready" in captured.out
-    assert state_file.is_file()
+    # Dry-run is audit+report only: it must NOT create or mutate the state
+    # file (the operator preview is hash-stable against the live ledger).
+    assert not state_file.exists()
 
 
 def test_cli_harness_loop_defaults_to_dry_run(tmp_path: Path, capsys) -> None:
@@ -4828,3 +5533,352 @@ def test_version_bump_consistent() -> None:
     repo_root = _Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
     assert hkrc.__version__ == pyproject["project"]["version"]
+
+
+# --- unresolvable skill-pin sweep (t_3de7f74e) -------------------------------
+
+
+def make_dist(tmp_path: Path, skills: dict[str, list[str]] | list[str]) -> Path:
+    """Build a fixture dist root; values are SKILL.md parent-chain segments.
+
+    A dict maps skill name -> nested category path (e.g.
+    {"humanizer": ["creative"]}); a bare list places skills at the top
+    level.  Both shapes must resolve — the live dist nests skills under
+    category dirs (creative/humanizer, projects/prototype-card-build).
+    """
+    root = tmp_path / "dist"
+    entries = skills.items() if isinstance(skills, dict) else ((name, []) for name in skills)
+    for name, path_parts in entries:
+        skill_dir = root.joinpath(*path_parts, name)
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+    return root
+
+
+def sweep_boards(tmp_path: Path, tasks: list[dict[str, Any]]) -> tuple[Finding, ...]:
+    """Build fixture boards, collect them via the snapshot path, and sweep.
+
+    Seeds the common live persona dirs (developer, frontend-dev) so the
+    pin-focused tests do not trip the assignee-no-profile check; tests that
+    target that check assign to a persona that is deliberately absent.
+    """
+    make_board(tmp_path / "boards", "fixture", tasks)
+    (tmp_path / "dist").mkdir(exist_ok=True)
+    profiles = tmp_path / "profiles"
+    profiles.mkdir(exist_ok=True)
+    for persona in ("developer", "frontend-dev"):
+        (profiles / persona).mkdir(exist_ok=True)
+    boards = collect_boards(tmp_path / "boards", now=NOW, window_hours=24)
+    return detect_unresolvable_skill_pin(
+        boards,
+        dist_skills_root=tmp_path / "dist",
+        profiles_root=profiles,
+    )
+
+
+def test_pin_sweep_all_missing_is_high(tmp_path: Path) -> None:
+    # Every pinned skill missing -> hard crash at spawn -> severity high.
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_pin",
+                "title": "impl: pinned",
+                "status": "ready",
+                "assignee": "developer",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["ghost-one", "ghost-two"]),
+            }
+        ],
+    )
+    pins = [f for f in findings if f.pattern == "skill-unresolvable"]
+    assert len(pins) == 1
+    assert pins[0].severity == "high"
+    assert pins[0].apply_kind == "none"
+    assert f"fixture:t_pin" == pins[0].key
+
+
+def test_pin_sweep_partial_missing_is_medium(tmp_path: Path) -> None:
+    # Some pins resolve, some do not -> core degrades gracefully -> medium.
+    make_dist(tmp_path, {"known-skill": []})
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_partial",
+                "title": "impl: partial",
+                "status": "ready",
+                "assignee": "developer",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["known-skill", "ghost"]),
+            }
+        ],
+    )
+    pins = [f for f in findings if f.pattern == "skill-unresolvable"]
+    assert len(pins) == 1
+    assert pins[0].severity == "medium"
+    assert pins[0].apply_kind == "none"
+
+
+def test_pin_sweep_all_resolvable_no_findings(tmp_path: Path) -> None:
+    make_dist(tmp_path, {"prototype-card-build": ["projects"]})
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_ok",
+                "title": "impl: fine",
+                "status": "ready",
+                "assignee": "developer",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["prototype-card-build"]),
+            }
+        ],
+    )
+    assert findings == ()
+
+
+def test_pin_sweep_skips_done_and_archived(tmp_path: Path) -> None:
+    # done/archived cards must never be flagged — the collector's
+    # window-independent open-row query already excludes them.
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_done",
+                "title": "done card",
+                "status": "done",
+                "assignee": "developer",
+                "created_at": NOW - 100,
+                "completed_at": NOW - 50,
+                "skills": json.dumps(["ghost"]),
+            },
+            {
+                "id": "t_arch",
+                "title": "archived card",
+                "status": "archived",
+                "assignee": "developer",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["ghost"]),
+            },
+        ],
+    )
+    assert findings == ()
+
+
+def test_pin_sweep_missing_dist_root_no_findings_no_error(tmp_path: Path) -> None:
+    # A missing dist root emits NO findings and raises nothing (tolerated).
+    make_board(
+        tmp_path / "boards",
+        "fixture",
+        [
+            {
+                "id": "t_pin",
+                "title": "impl: pinned",
+                "status": "ready",
+                "assignee": "developer",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["prototype-card-build"]),
+            }
+        ],
+    )
+    boards = collect_boards(tmp_path / "boards", now=NOW, window_hours=24)
+    findings = detect_unresolvable_skill_pin(
+        boards,
+        dist_skills_root=tmp_path / "dist",  # never created
+        profiles_root=tmp_path / "profiles",  # never created either
+    )
+    assert findings == ()
+
+
+def test_pin_sweep_reproduces_t_13c010da(tmp_path: Path) -> None:
+    # Regression: casa-gungalilin t_13c010da — single mandatory pin
+    # prototype-card-build absent from the dist -> exactly one HIGH finding
+    # whose evidence names the card id and the skill.  (The live landmine
+    # was defused by shipping the skill to the dist on 2026-08-31; this
+    # fixture preserves the failure shape forever.)
+    make_board(
+        tmp_path / "boards",
+        "casa-gungalilin",
+        [
+            {
+                "id": "t_13c010da",
+                "title": "impl: prototype card build",
+                "status": "blocked",
+                "assignee": "frontend-dev",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["prototype-card-build"]),
+            }
+        ],
+    )
+    (tmp_path / "dist").mkdir()  # exists but resolves nothing
+    boards = collect_boards(tmp_path / "boards", now=NOW, window_hours=24)
+    findings = detect_unresolvable_skill_pin(
+        boards,
+        dist_skills_root=tmp_path / "dist",  # exists but empty
+        profiles_root=tmp_path / "profiles",
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.pattern == "skill-unresolvable"
+    assert finding.severity == "high"
+    assert finding.apply_kind == "none"
+    evidence = " ".join(finding.evidence)
+    assert "t_13c010da" in evidence
+    assert "prototype-card-build" in evidence
+
+
+def test_pin_sweep_names_profile_private_owner(tmp_path: Path) -> None:
+    # A missing skill sitting in a profile-private dir is evidence context:
+    # it resolves for NOBODY, not even the persona that owns it.
+    owner_dir = tmp_path / "profiles" / "lead-orchestrator" / "skills" / "prototype-card-build"
+    owner_dir.mkdir(parents=True)
+    (owner_dir / "SKILL.md").write_text("# prototype-card-build\n", encoding="utf-8")
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_private",
+                "title": "impl: private skill",
+                "status": "ready",
+                "assignee": "frontend-dev",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["prototype-card-build"]),
+            }
+        ],
+    )
+    assert len(findings) == 1
+    evidence = " ".join(findings[0].evidence)
+    assert "lead-orchestrator" in evidence
+    assert "profile-private" in evidence
+
+
+def test_pin_sweep_assignee_no_profile(tmp_path: Path) -> None:
+    # backend-dev has no profile dir -> the card can never dispatch.
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_noprofile",
+                "title": "impl: orphan assignee",
+                "status": "todo",
+                "assignee": "backend-dev",
+                "created_at": NOW - 100,
+            }
+        ],
+    )
+    missing = [f for f in findings if f.pattern == "assignee-no-profile"]
+    assert len(missing) == 1
+    assert missing[0].severity == "high"
+    assert missing[0].apply_kind == "none"
+    assert "backend-dev" in " ".join(missing[0].evidence)
+
+
+def test_pin_sweep_assignee_directive_prefix_is_profile(tmp_path: Path) -> None:
+    # Live cards carry free-text directives ("reviewer: synthesize swarm");
+    # only the prefix before ':' names the profile, and reviewer exists.
+    profile_dir = tmp_path / "profiles" / "reviewer"
+    profile_dir.mkdir(parents=True)
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_directive",
+                "title": "impl: directive assignee",
+                "status": "ready",
+                "assignee": "reviewer: synthesize swarm",
+                "created_at": NOW - 100,
+            }
+        ],
+    )
+    assert findings == ()
+
+
+def test_pin_sweep_never_writes_dist_or_profiles(tmp_path: Path) -> None:
+    # Effect boundary (t_7dca44ce batch-1 #3): the sweep READS the dist and
+    # the profiles root and must never write under either.
+    make_board(
+        tmp_path / "boards",
+        "fixture",
+        [
+            {
+                "id": "t_pin",
+                "title": "impl: pinned",
+                "status": "ready",
+                "assignee": "ghost-persona",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["prototype-card-build", "ghost"]),
+            }
+        ],
+    )
+    make_dist(tmp_path, {"prototype-card-build": ["projects"]})
+    dist_root = tmp_path / "dist"
+    profiles_root = tmp_path / "profiles"
+    (profiles_root / "developer").mkdir(parents=True, exist_ok=True)
+
+    def snapshot(root: Path) -> set[str]:
+        return {str(p.relative_to(root)) for p in root.rglob("*")}
+
+    before_dist = snapshot(dist_root)
+    before_profiles = snapshot(profiles_root)
+    boards = collect_boards(tmp_path / "boards", now=NOW, window_hours=24)
+    findings = detect_unresolvable_skill_pin(
+        boards,
+        dist_skills_root=dist_root,
+        profiles_root=profiles_root,
+    )
+    # Both finding kinds fired (partial pin miss -> medium, ghost persona).
+    assert {f.pattern for f in findings} == {
+        "skill-unresolvable",
+        "assignee-no-profile",
+    }
+    assert snapshot(dist_root) == before_dist  # nothing written under dist
+    assert snapshot(profiles_root) == before_profiles  # ...or under profiles
+    for finding in findings:
+        assert finding.apply_kind == "none"
+
+
+def test_pin_sweep_no_board_reads_of_real_hermes(tmp_path: Path) -> None:
+    # The sweep runs entirely on fixture paths: every finding key must be
+    # anchored to the fixture board, and the detector accepts fixture-only
+    # roots (no defaulting to ~/.hermes anywhere in the call path).
+    make_dist(tmp_path, {"real-skill": []})
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_anchor",
+                "title": "impl: anchored",
+                "status": "ready",
+                "assignee": "developer",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["real-skill"]),
+            }
+        ],
+    )
+    assert findings == ()
+
+
+def test_run_end_to_end_pin_sweep_reported(tmp_path: Path) -> None:
+    # Full loop: a card with an unresolvable pin surfaces in the rendered
+    # report's "What's wrong" section under its human title, report-only.
+    sessions_db = make_sessions_db(tmp_path / "profiles" / "main" / "state.db", [])
+    make_dist(tmp_path, {"fine-skill": []})
+    make_board(
+        tmp_path / "boards",
+        "fixture",
+        [
+            {
+                "id": "t_landmine",
+                "title": "impl: landmine",
+                "status": "ready",
+                "assignee": "frontend-dev",
+                "created_at": NOW - 100,
+                "skills": json.dumps(["ghost-skill"]),
+            }
+        ],
+    )
+    config = make_config(tmp_path, sessions_db=sessions_db, dist_skills_root=tmp_path / "dist")
+    report = run(config, now=NOW, dry_run=True)
+    assert "Unresolvable pinned skill" in report
+    assert "HIGH" in report

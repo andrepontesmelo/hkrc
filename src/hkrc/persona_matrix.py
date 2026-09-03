@@ -31,11 +31,24 @@ REASONING_HIGH = "high"
 STATUS_ACTIVE = "active"
 STATUS_ELIMINATED = "eliminated"
 
+#: Pro-tier model ids recognized by the drift flagger (t_a832a269): the
+#: bare direct-zai id (live since the 2026-09-01 direct-zai migration),
+#: the legacy OmniRoute provider-qualified form, and the 2026-09-01
+#: OmniRoute combo form. ``-flash`` variants never appear here — the
+#: flash tier wins first in ``persona_drift._model_tier``.
+PRO_MODEL_IDS: frozenset[str] = frozenset(
+    {"glm-5.3", "zai/glm-5.3", "virtual/glm-5.3"}
+)
+
 #: The single documented override exception: authoritative's standing
 #: ``pro -> max`` reasoning override is part of the unchanged meta-analysis
-#: lane (t_49ba1035 Q6). Every other reasoning/model override on a matrix
-#: persona is drift ("NO overrides at any level").
-AUTHORITATIVE_ALLOWED_OVERRIDE = ("zai/glm-5.3", "max")
+#: lane (t_49ba1035 Q6). Accepted under every recognized pro id form
+#: (PRO_MODEL_IDS, t_a832a269 — the live profile carries the bare id).
+#: Every other reasoning/model override on a matrix persona is drift
+#: ("NO overrides at any level").
+AUTHORITATIVE_ALLOWED_OVERRIDE: frozenset[tuple[str, str]] = frozenset(
+    (model_id, "max") for model_id in PRO_MODEL_IDS
+)
 
 
 @dataclass(frozen=True, slots=True)

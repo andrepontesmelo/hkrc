@@ -23,6 +23,7 @@ from hkrc.persona_drift import (
     WRONG_MODEL,
     DriftFinding,
     ProfileSnapshot,
+    _model_tier,
     check_profiles,
     check_snapshot,
     check_snapshots,
@@ -98,6 +99,77 @@ def test_authoritative_matching_config_passes() -> None:
         reasoning_overrides=(("zai/glm-5.3", "max"),),
     )
     assert check_snapshot(snapshot) == []
+
+
+# --- tier map (t_a832a269) ---------------------------------------------------
+
+
+def test_tier_map_accepts_every_glm_pro_id_form() -> None:
+    # The 2026-09-01 direct-zai migration (bare id), the legacy
+    # zai/-prefixed form, and the earlier OmniRoute virtual/ combo all
+    # name the pro tier.
+    assert _model_tier("glm-5.3") == "pro"
+    assert _model_tier("zai/glm-5.3") == "pro"
+    assert _model_tier("virtual/glm-5.3") == "pro"
+
+
+def test_tier_map_flash_wins_over_pro_set() -> None:
+    # -flash variants must map flash even though they contain the bare
+    # pro id as a substring.
+    assert _model_tier("glm-5.3-flash") == "flash"
+    assert _model_tier("virtual/glm-5.3-flash") == "flash"
+
+
+def test_tier_map_glm_case_insensitive() -> None:
+    assert _model_tier("GLM-5.3") == "pro"
+    assert _model_tier("Virtual/GLM-5.3-Flash") == "flash"
+
+
+def test_tier_map_still_recognizes_non_glm_tiers() -> None:
+    assert _model_tier("opencode-go/deepseek-v4-flash") == "flash"
+    assert _model_tier("cx/gpt-5.6-luna-high") == "luna-high"
+    assert _model_tier("some-model-pro") == "pro"
+
+
+def test_tier_map_unrecognized_and_none() -> None:
+    # Near-miss GLM ids stay drift: unknown minor version, unknown
+    # prefix, unknown variant.
+    assert _model_tier("glm-5.4") is None
+    assert _model_tier("foo/glm-5.3") is None
+    assert _model_tier("glm-5.3-x") is None
+    assert _model_tier("opencode-go/deepseek-v4-ultra") is None
+    assert _model_tier(None) is None
+
+
+def test_authoritative_carries_bare_pro_id_without_drift() -> None:
+    # The live post-migration state: authoritative defaults to the bare
+    # direct-zai pro id with the pro -> max override; both must pass.
+    snapshot = ProfileSnapshot(
+        persona="authoritative", model="glm-5.3",
+        reasoning_overrides=(("glm-5.3", "max"),),
+    )
+    assert check_snapshot(snapshot) == []
+
+
+def test_authoritative_override_exception_accepts_every_pro_form() -> None:
+    # The documented pro -> max exception survives whichever pro id form
+    # the profile carries; any other model or level is still drift.
+    for model_id in ("glm-5.3", "zai/glm-5.3", "virtual/glm-5.3"):
+        snapshot = ProfileSnapshot(
+            persona="authoritative", model=model_id,
+            reasoning_overrides=((model_id, "max"),),
+        )
+        assert check_snapshot(snapshot) == [], model_id
+    wrong_level = ProfileSnapshot(
+        persona="authoritative", model="glm-5.3",
+        reasoning_overrides=(("glm-5.3", "high"),),
+    )
+    assert codes(check_snapshot(wrong_level)) == [OVERRIDE_PRESENT]
+    wrong_model = ProfileSnapshot(
+        persona="authoritative", model="glm-5.3",
+        reasoning_overrides=(("opencode-go/deepseek-v4-flash", "max"),),
+    )
+    assert codes(check_snapshot(wrong_model)) == [OVERRIDE_PRESENT]
 
 
 # --- wrong model / unset model ----------------------------------------------
@@ -305,6 +377,12 @@ agent:
     "zai/glm-5.3": max
 """
 
+AUTHORITATIVE_CONFIG_DIRECT_ZAI = """\
+model:
+  default: glm-5.3
+  provider: zai
+"""
+
 
 def _write(root: Path, name: str, content: str) -> Path:
     profile_dir = root / name
@@ -337,6 +415,17 @@ def test_read_profile_config_authoritative_override_block(tmp_path: Path) -> Non
     assert snapshot.model == "zai/glm-5.3"
     assert snapshot.reasoning_effort == "medium"
     assert snapshot.reasoning_overrides == (("zai/glm-5.3", "max"),)
+
+
+def test_read_profile_config_authoritative_direct_zai_shape(tmp_path: Path) -> None:
+    # Live shape since the 2026-09-01 direct-zai migration (t_a832a269):
+    # bare pro id, zai provider, no reasoning keys.
+    path = _write(tmp_path, "authoritative", AUTHORITATIVE_CONFIG_DIRECT_ZAI)
+    snapshot = read_profile_config(path)
+    assert snapshot.model == "glm-5.3"
+    assert snapshot.reasoning_effort is None
+    assert snapshot.reasoning_overrides == ()
+    assert check_snapshot(snapshot) == []
 
 
 def test_read_profile_config_never_writes_input(tmp_path: Path) -> None:
