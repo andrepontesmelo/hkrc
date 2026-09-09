@@ -195,6 +195,15 @@ def test_hook_command_non_prepared_states_pass(tmp_path: Path) -> None:
         assert run_hook_command(tmp_path / "missing.toml", hook_state=state_name) == 0
 
 
+def test_hook_command_preparing_state_enforces(tmp_path: Path) -> None:
+    """Git 2.55 added the ``preparing`` state; it must deny like ``prepared``."""
+    state, guard = open_guard(tmp_path)
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, ControllerConfig("gate2-git", tmp_path / "boards", state.path))
+    register_merge_contract(state, guard)
+    assert run_hook_command(config_path, hook_state="preparing", stdin_lines=[TUPLES]) == 1
+
+
 def test_hook_command_malformed_input_fails_closed(tmp_path: Path) -> None:
     state, guard = open_guard(tmp_path)
     config_path = tmp_path / "config.toml"

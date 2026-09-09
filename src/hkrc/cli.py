@@ -616,7 +616,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     git_hook.add_argument(
         "--state",
-        choices=("prepared", "committed", "aborted"),
+        choices=("preparing", "prepared", "committed", "aborted"),
         help="transaction state passed by git as the single hook argument",
     )
     git_hook.add_argument("--config", type=Path, default=default_config_path())
@@ -1236,7 +1236,7 @@ def _outcome_guard_authorize_merge(args: argparse.Namespace) -> int:
 def _outcome_guard_git_hook_run(args: argparse.Namespace) -> int:
     if args.state is None:
         raise OutcomeGuardError(
-            "git-hook requires --state (prepared/committed/aborted) or a "
+            "git-hook requires --state (preparing/prepared/committed/aborted) or a "
             "subcommand (install/uninstall/status)"
         )
     return run_hook_command(args.config, hook_state=args.state, audit_only=args.audit_only)

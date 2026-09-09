@@ -1,10 +1,12 @@
 """Portable Git ``reference-transaction`` adapter for the outcome guard.
 
 The ``reference-transaction`` hook (Git 2.36+) is invoked once per reference
-transaction with the state as its single argument (``prepared``,
-``committed``, or ``aborted``) and one line per reference update on stdin:
-``<old-oid> SP <new-oid> SP <ref-name> LF``. Only the ``prepared`` state
-consults the exit status: a non-zero exit aborts the whole transaction.
+transaction with the state as its single argument (``preparing``,
+``prepared``, ``committed``, or ``aborted``) and one line per reference
+update on stdin: ``<old-oid> SP <new-oid> SP <ref-name> LF``. Git 2.55 added
+the ``preparing`` state, which fires before ``prepared``; both ``preparing``
+and ``prepared`` consult the exit status: a non-zero exit aborts the whole
+transaction.
 
 This module implements that contract without ever parsing commit messages as
 authority. A protected canonical ref (``refs/heads/main`` by default) is
@@ -163,7 +165,7 @@ def run_hook_command(
     stdout without ever denying.
     """
 
-    if hook_state != "prepared":
+    if hook_state not in ("preparing", "prepared"):
         return 0
     try:
         updates = parse_reference_transaction(stdin_lines if stdin_lines is not None else _read_stdin())
