@@ -22,6 +22,7 @@ import os
 import subprocess
 
 from .config import ControllerConfig
+from .gateway import GatewayRequest, run_gateway_checks
 from .outcome_guard import OutcomeGuard, PolicyResult
 from .state import ControllerState
 
@@ -136,6 +137,20 @@ def admit_child(
             policy=policy,
         )
         return AdmissionReport(False, policy.reason_code, None, duplicate=False, policy=policy)
+
+    gateway = run_gateway_checks(
+        GatewayRequest(
+            title=title,
+            board_slug=board_slug,
+            body=body,
+            idempotency_key=f"{ADMISSION_KEY_PREFIX}{admission_key}",
+        )
+    )
+    if not gateway.ok:
+        detail = "; ".join(
+            f"{violation.code}: {violation.message}" for violation in gateway.violations
+        )
+        raise AdmissionError(f"gateway rejected child create: {detail}")
 
     create_command = [
         config.native_cli,

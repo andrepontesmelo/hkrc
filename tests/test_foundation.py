@@ -212,11 +212,11 @@ def test_state_is_controller_owned_and_idempotent(tmp_path: Path) -> None:
     state_path = tmp_path / "state" / "controller.sqlite3"
     with ControllerState.initialize(state_path, "default") as state:
         assert state.instance_name == "default"
-        assert state.schema_version == 7
+        assert state.schema_version == 8
 
     with ControllerState.initialize(state_path, "default") as state:
         assert state.instance_name == "default"
-        assert state.schema_version == 7
+        assert state.schema_version == 8
 
     with sqlite3.connect(state_path) as connection:
         tables = {
@@ -290,7 +290,7 @@ def test_cli_init_and_status_are_explicitly_non_recovery(tmp_path: Path, capsys)
     status_output = capsys.readouterr().out
     assert "native_boards_root=" in status_output
     assert "(not scanned)" in status_output
-    assert "schema_version=7" in status_output
+    assert "schema_version=8" in status_output
     assert "stream_mode=manual_compatibility" in status_output
     assert "stream_enabled=false" in status_output
 

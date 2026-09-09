@@ -31,6 +31,16 @@ REASONING_HIGH = "high"
 STATUS_ACTIVE = "active"
 STATUS_ELIMINATED = "eliminated"
 
+#: Flash-tier model ids recognized by the drift flagger (t_54060309): the
+#: fleet swapped glm-5.3-flash -> zen13/muse-spark-1.3-contributor-free
+#: (main + all profiles, 2026-09-03) and the new id names neither the
+#: flash nor the pro tier, so it needs an explicit mapping. ``-flash``
+#: variants never appear here — the flash tier wins first in
+#: ``persona_drift._model_tier``.
+FLASH_MODEL_IDS: frozenset[str] = frozenset(
+    {"zen13/muse-spark-1.3-contributor-free"}
+)
+
 #: Pro-tier model ids recognized by the drift flagger (t_a832a269): the
 #: bare direct-zai id (live since the 2026-09-01 direct-zai migration),
 #: the legacy OmniRoute provider-qualified form, and the 2026-09-01

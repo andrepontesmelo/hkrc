@@ -28,10 +28,12 @@ import time
 
 RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")
 PACKAGE_DIR = Path("src") / "hkrc"
-SKILL_DIR = Path("skills") / "hermes-kanban-blocker-recovery"
+SKILL_DIRS: tuple[tuple[Path, str], ...] = (
+    (Path("skills") / "hermes-kanban-blocker-recovery", "blocker-recovery"),
+    (Path("skills") / "friction-flag", "friction-flag"),
+)
 SERVICE_TEMPLATE = Path("systemd") / "hkrc.service.in"
 SERVICE_RELATIVE_PATH = Path("systemd") / "hkrc.service"
-SKILL_DEST_NAME = "blocker-recovery"
 PROMPT_TEMPLATE = Path("config") / "hkrc" / "needs-input-watcher-prompt.txt"
 MANIFEST_TEMPLATE = Path("config") / "hkrc" / "cron_manifest.json"
 DOCS_DIR = Path("docs")
@@ -166,7 +168,7 @@ def _validate_source(source: Path) -> None:
     for relative in (
         PACKAGE_DIR / "__init__.py",
         PACKAGE_DIR / "cli.py",
-        SKILL_DIR / "SKILL.md",
+        *(skill_dir / "SKILL.md" for skill_dir, _ in SKILL_DIRS),
         SERVICE_TEMPLATE,
         PROMPT_TEMPLATE,
         MANIFEST_TEMPLATE,
@@ -251,7 +253,7 @@ def _activate(root: Path, version: str, *, old_current: Path | None) -> None:
 
 
 def _sync_instance_files(root: Path, version: str) -> None:
-    """Copy the release skill into Hermes' normal instance skill directory.
+    """Copy each release skill into Hermes' normal instance skill directory.
 
     Also seed the versioned needs-input-watcher prompt template and the cron
     manifest into the instance config directory. The prompt seed never
@@ -261,13 +263,19 @@ def _sync_instance_files(root: Path, version: str) -> None:
     sync`, so it is refreshed unconditionally on every release.
     """
 
-    source = root / "releases" / version / SKILL_DIR
-    destination = root / "skills" / SKILL_DEST_NAME
-    temporary = destination.with_name(f".{destination.name}.tmp")
-    shutil.rmtree(temporary, ignore_errors=True)
-    shutil.copytree(source, temporary)
-    shutil.rmtree(destination, ignore_errors=True)
-    temporary.rename(destination)
+    for skill_dir, dest_name in SKILL_DIRS:
+        source = root / "releases" / version / skill_dir
+        destination = root / "skills" / dest_name
+        if not source.is_dir():
+            # Older materialized releases may predate a skill: sync only what
+            # the release ships and drop any stale installed copy of the rest.
+            shutil.rmtree(destination, ignore_errors=True)
+            continue
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        shutil.rmtree(temporary, ignore_errors=True)
+        shutil.copytree(source, temporary)
+        shutil.rmtree(destination, ignore_errors=True)
+        temporary.rename(destination)
 
     prompt_destination = root / PROMPT_TEMPLATE
     if not prompt_destination.exists():

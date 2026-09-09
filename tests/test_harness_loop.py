@@ -66,6 +66,7 @@ from hkrc.harness_loop import (
 
 NOW = 100_000
 DAY = 86_400
+HOUR = 3600
 
 # Live writer connections for boards built with ``make_board(..., wal=True)``.
 # Closing the last connection to a WAL database checkpoints and deletes the
@@ -321,6 +322,11 @@ def make_config(
             # dir and would leak real campcli/ynab-pilot findings into
             # every fixture run.  A nonexistent dir yields zero findings.
             archloop_output_dir=str(tmp_path / "archloop-output"),
+            # Hermetic pin for the cron self-health store (t_78c47d92):
+            # the auto chain would resolve the operator's REAL
+            # ~/.hermes/cron/jobs.json and leak live job health into
+            # fixture runs.  A nonexistent file yields zero findings.
+            cron_jobs_path=str(tmp_path / "cron" / "jobs.json"),
             config_drift_allowed_profiles=config_drift_allowed_profiles,
             decision_latency_seconds=decision_latency_seconds,
             decision_latency_human_seconds=decision_latency_human_seconds,
@@ -5882,3 +5888,185 @@ def test_run_end_to_end_pin_sweep_reported(tmp_path: Path) -> None:
     report = run(config, now=NOW, dry_run=True)
     assert "Unresolvable pinned skill" in report
     assert "HIGH" in report
+
+
+# --- daemon-intervention evidence (t_129a1a08) --------------------------------
+
+
+def make_interventions_db(path: Path, rows: list[dict[str, Any]]) -> Path:
+    """Build a controller state.sqlite3 with the real interventions schema."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE interventions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            board_slug TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            outcome TEXT,
+            error TEXT,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (board_slug, task_id)
+        );
+        """
+    )
+    for row in rows:
+        connection.execute(
+            "INSERT INTO interventions(board_slug, task_id, phase, outcome, "
+            "error, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["board_slug"],
+                row["task_id"],
+                row.get("phase", "complete"),
+                row.get("outcome"),
+                row.get("error"),
+                row["started_at"],
+                row["updated_at"],
+            ),
+        )
+    connection.commit()
+    connection.close()
+    return path
+
+
+def _iso_utc(epoch: int) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def test_detect_all_runs_daemon_regression_detector(tmp_path: Path) -> None:
+    # The default-argument contract: _detect_all without interventions still
+    # runs the detector (empty evidence, no findings) — positional callers
+    # (simulation, older tests) must keep working.
+    assert _detect_all((), (), "", NOW, make_config(tmp_path)) == ()
+    from hkrc.harness_loop import InterventionRow
+
+    row = InterventionRow(
+        board_slug="fixture",
+        task_id="t_regress",
+        phase="complete",
+        outcome="ok",
+        error=None,
+        started_at=_iso_utc(NOW - HOUR - 30),
+        updated_at=_iso_utc(NOW - HOUR),
+    )
+    boards = (
+        BoardEvidence(
+            slug="fixture",
+            status_counts=(),
+            tasks_in_window=(),
+            runs_in_window=(),
+            failure_events=(),
+            children={},
+            blocked_rows=(("t_regress", "impl: x", NOW, "stuck", None),),
+            open_task_rows=(),
+        ),
+    )
+    findings = _detect_all(
+        (), boards, "", NOW, make_config(tmp_path), interventions=(row,)
+    )
+    assert [f.pattern for f in findings] == ["daemon-regression"]
+    assert findings[0].apply_kind == "none"
+
+
+def test_run_wires_interventions_and_report_section(tmp_path: Path) -> None:
+    # End to end: a state DB with one ok handoff, a board where that card is
+    # currently blocked again, and a second fresh non-ok handoff for the
+    # report section.  Expect: the HIGH daemon-regression finding in "What's
+    # wrong" AND both handoff lines in the report-only section.
+    sessions_db = make_sessions_db(tmp_path / "profiles" / "main" / "state.db", [])
+    make_board(
+        tmp_path / "boards",
+        "fixture",
+        [
+            {
+                "id": "t_regress",
+                "title": "fix: reland the dropped guard",
+                "status": "blocked",
+                "assignee": "developer",
+                "created_at": NOW - 3 * DAY,
+                "block_kind": "needs_input",
+            },
+            {
+                "id": "t_other",
+                "title": "chore: unrelated",
+                "status": "done",
+                "assignee": "developer",
+                "created_at": NOW - 2 * DAY,
+                "completed_at": NOW - DAY,
+            },
+        ],
+        events={"t_regress": [("blocked", NOW, "review-required: nit")]},
+    )
+    make_interventions_db(
+        tmp_path / "state" / "hkrc" / "state.sqlite3",
+        [
+            {
+                "board_slug": "fixture",
+                "task_id": "t_regress",
+                "outcome": "ok",
+                "started_at": _iso_utc(NOW - 2 * HOUR - 30),
+                "updated_at": _iso_utc(NOW - 2 * HOUR),
+            },
+            {
+                "board_slug": "fixture",
+                "task_id": "t_other",
+                "outcome": "error",
+                "error": "unblock rejected by guard",
+                "started_at": _iso_utc(NOW - HOUR - 30),
+                "updated_at": _iso_utc(NOW - HOUR),
+            },
+        ],
+    )
+    config = make_config(tmp_path, sessions_db=sessions_db)
+    trace: list[dict[str, Any]] = []
+    report = run(config, now=NOW, dry_run=True, trace=trace)
+    # Detector surfaced through the ranked queue.
+    assert "Daemon intervention regression" in report
+    assert "HIGH" in report
+    # Report-only handoff section: every in-window intervention, ok or error.
+    assert "Daemon handoffs (last 24h, report-only)" in report
+    assert f"t_regress outcome=ok at {_iso_utc(NOW - 2 * HOUR)}" in report
+    assert f"t_other outcome=error at {_iso_utc(NOW - HOUR)}" in report
+    assert trace[0]["interventions_count"] == 2
+
+
+def test_run_daemon_regression_absent_when_board_clean(tmp_path: Path) -> None:
+    # Status-blind control through the full run: ok handoff, card done, no
+    # re-block evidence -> no daemon-regression finding, section still present.
+    sessions_db = make_sessions_db(tmp_path / "profiles" / "main" / "state.db", [])
+    make_board(
+        tmp_path / "boards",
+        "fixture",
+        [
+            {
+                "id": "t_recovered",
+                "title": "fix: landed cleanly",
+                "status": "done",
+                "assignee": "developer",
+                "created_at": NOW - 2 * DAY,
+                "completed_at": NOW - HOUR,
+            }
+        ],
+    )
+    make_interventions_db(
+        tmp_path / "state" / "hkrc" / "state.sqlite3",
+        [
+            {
+                "board_slug": "fixture",
+                "task_id": "t_recovered",
+                "outcome": "ok",
+                "started_at": _iso_utc(NOW - 2 * HOUR - 30),
+                "updated_at": _iso_utc(NOW - 2 * HOUR),
+            }
+        ],
+    )
+    config = make_config(tmp_path, sessions_db=sessions_db)
+    report = run(config, now=NOW, dry_run=True)
+    assert "Daemon intervention regression" not in report
+    assert "Daemon handoffs (last 24h, report-only)" in report
+    assert "t_recovered outcome=ok" in report

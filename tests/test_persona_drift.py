@@ -113,6 +113,24 @@ def test_tier_map_accepts_every_glm_pro_id_form() -> None:
     assert _model_tier("virtual/glm-5.3") == "pro"
 
 
+def test_tier_map_muse_spark_free_id_is_flash() -> None:
+    # Fleet swap 2026-09-03 (t_54060309): glm-5.3-flash ->
+    # zen13/muse-spark-1.3-contributor-free. The new id names neither the
+    # flash nor the pro tier, so it maps via the explicit FLASH_MODEL_IDS
+    # set; matching is case-insensitive like the pro set.
+    assert _model_tier("zen13/muse-spark-1.3-contributor-free") == "flash"
+    assert _model_tier("ZEN13/MUSE-SPARK-1.3-CONTRIBUTOR-FREE") == "flash"
+
+
+def test_developer_on_fleet_flash_id_passes() -> None:
+    # Live post-swap state: developer defaults to the fleet flash id.
+    snapshot = ProfileSnapshot(
+        persona="developer", model="zen13/muse-spark-1.3-contributor-free",
+        reasoning_effort="high",
+    )
+    assert check_snapshot(snapshot) == []
+
+
 def test_tier_map_flash_wins_over_pro_set() -> None:
     # -flash variants must map flash even though they contain the bare
     # pro id as a substring.

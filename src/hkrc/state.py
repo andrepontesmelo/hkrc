@@ -9,7 +9,7 @@ import sqlite3
 from typing import Self
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class StateError(RuntimeError):
@@ -67,7 +67,7 @@ class StreamCursorState:
 
 
 _SCHEMA = """
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;
 
 CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
@@ -236,6 +236,19 @@ CREATE TABLE IF NOT EXISTS assist_candidate_events (
 
 CREATE INDEX IF NOT EXISTS idx_assist_candidates_state
     ON assist_candidates(state, created_at);
+
+CREATE TABLE IF NOT EXISTS friction_flags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    severity TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high')),
+    kind TEXT NOT NULL,
+    note TEXT NOT NULL,
+    session_ref TEXT,
+    profile_ref TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_flags_created_at
+    ON friction_flags(created_at);
 """
 
 
@@ -405,6 +418,35 @@ class ControllerState:
             (board_slug, task_id),
         ).fetchone()
         return row is not None
+
+    def record_friction_flag(
+        self,
+        *,
+        severity: str,
+        kind: str,
+        note: str,
+        session_ref: str | None,
+        profile_ref: str | None,
+    ) -> int:
+        """Append one inert friction flag row and return its row id."""
+
+        cursor = self.connection.execute(
+            """
+            INSERT INTO friction_flags
+                (severity, kind, note, session_ref, profile_ref, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (severity, kind, note, session_ref, profile_ref, _utc_now()),
+        )
+        self.connection.commit()
+        assert cursor.lastrowid is not None
+        return int(cursor.lastrowid)
+
+    def friction_flag_count(self) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM friction_flags"
+        ).fetchone()
+        return int(row["count"])
 
     def record_resolution(
         self,

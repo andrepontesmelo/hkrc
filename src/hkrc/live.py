@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import socket
 import ssl
 import subprocess
@@ -509,6 +510,32 @@ def _run_sort_key(run: Mapping[str, Any]) -> tuple[int, int]:
     return started, numeric_id
 
 
+def validate_native_cli(cli: str) -> None:
+    """Fail fast when the configured native CLI binary is unusable.
+
+    Bare names resolve via ``shutil.which`` against the daemon's real
+    ``os.environ`` PATH; paths containing a separator must exist and be
+    executable.  On failure raise ``HandoffError`` naming the binary and
+    the PATH seen so systemd logs point at the fix (absolute ``[native]``
+    ``cli`` path) instead of cycling blind.
+    """
+    seen_path = os.environ.get("PATH", "")
+    if os.sep in cli or (os.altsep and os.altsep in cli):
+        if os.path.isfile(cli) and os.access(cli, os.X_OK):
+            return
+        raise HandoffError(
+            f"native cli '{cli}' is not an executable file; "
+            f"set [native] cli to an absolute path (PATH seen: '{seen_path}')"
+        )
+    if shutil.which(cli):
+        return
+    raise HandoffError(
+        f"native cli '{cli}' not found on PATH '{seen_path}'; "
+        "set [native] cli to an absolute path "
+        "(e.g. cli = \"/home/example-user/.local/bin/hermes\")"
+    )
+
+
 def _optional_string(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
@@ -530,7 +557,7 @@ def build_live_stream_wiring(
     classifier a synthetic ``gave_up`` confirmation so recoverable cards are
     reserved without waiting for an event that already happened.
     """
-
+    validate_native_cli(config.native_cli)
     stream = config.stream
     if not stream.enabled or stream.adapter != "approved_websocket":
         raise HandoffError("approved WebSocket stream mode is not enabled")
@@ -595,4 +622,5 @@ __all__ = [
     "WebSocketConnector",
     "WebSocketProtocolError",
     "build_live_stream_wiring",
+    "validate_native_cli",
 ]

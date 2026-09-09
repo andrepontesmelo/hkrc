@@ -34,7 +34,7 @@ from .classifier import (
     classify_stream_error,
 )
 from .config import ControllerConfig
-from .discovery import DiscoveryError
+from .discovery import DiscoveryError, discover_boards
 from .event_stream import (
     EventBatch,
     StreamAdapter,
@@ -46,9 +46,11 @@ from .event_stream import (
 from .handoff import (
     HandoffError,
     HandoffReport,
+    NativeRunner,
     execute_reserved_handoff,
 )
 from .self_health import format_stream_alert, format_stream_recovery
+from .storm_halt import StormFinding, apply_halt, detect_storms
 from .live import CurrentStateReaderError
 from .stale_block_watch import is_config_defect, is_silent_death_block
 from .state import ControllerState, StateError, StreamCursorState, StreamEventKey
@@ -636,6 +638,124 @@ def _reservation_kind(result: ClassificationResult) -> str | None:
     return "crashed"
 
 
+def _default_storm_check(config: ControllerConfig) -> Callable[[int], tuple[StormFinding, ...]]:
+    """Build the production storm detector: R3 SQL over board snapshots.
+
+    Every non-archived board's ``kanban.db`` is snapshot-copied to a temp
+    file (sqlite3 online backup API — the live file and its WAL sidecars
+    are only ever read) and the exact R3 storm SQL runs on the copy.  One
+    unreadable board is logged and skipped; it never blocks the check.
+    """
+
+    from .harness_loop import _open_board_snapshot
+
+    def check(now: int) -> tuple[StormFinding, ...]:
+        # The boards root itself missing (never true in production — the
+        # config validates it at startup) propagates and is caught by the
+        # caller as storm_check_error; per-board problems are isolated.
+        boards = discover_boards(config.native_boards_root)
+        findings: list[StormFinding] = []
+        for board in boards:
+            try:
+                with _open_board_snapshot(board.path / "kanban.db") as connection:
+                    findings.extend(detect_storms(connection, board.slug, now=now))
+            except Exception as exc:
+                _storm_board_skip_log(config, board.slug, exc)
+                continue
+        return tuple(findings)
+
+    return check
+
+
+def _storm_board_skip_log(config: ControllerConfig, board_slug: str, exc: Exception) -> None:
+    """Log one unreadable board at debug level (journald-only, best-effort)."""
+
+    logging.getLogger("hkrc.daemon").debug(
+        json.dumps(
+            {
+                "event": "storm_check_board_skipped",
+                "instance": config.instance_name,
+                "board": board_slug,
+                "error": str(exc),
+            },
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+def _default_storm_halt_runner(config: ControllerConfig) -> NativeRunner:
+    """Production halt runner: subprocess argv execution, never a shell."""
+
+    from .handoff import _run_native
+
+    return _run_native
+
+
+def _default_storm_halt(
+    finding: StormFinding,
+    config: ControllerConfig,
+    *,
+    runner: NativeRunner,
+):
+    """List the lane's ready cards and block them via the constrained applier.
+
+    Ready-card listing goes through the read-only ``list --status ready
+    --json`` CLI (the same channel the watcher already uses).  The applier
+    allowlist in ``storm_halt.apply_halt`` makes any verb other than
+    ``block`` unreachable.
+    """
+
+    from .storm_halt import list_ready_task_ids
+
+    ready = list_ready_task_ids(
+        config.native_cli,
+        config.native_profile,
+        finding.board_slug,
+        profile=finding.profile,
+        runner=runner,
+    )
+    return apply_halt(
+        finding,
+        ready,
+        runner=runner,
+        native_cli=config.native_cli,
+        native_profile=config.native_profile,
+    )
+
+
+def finding_evidence_fields(finding: StormFinding) -> dict[str, object]:
+    """Flatten a finding's SQL evidence into loggable key/value fields."""
+
+    return {
+        "board": finding.board_slug,
+        "profile": finding.profile,
+        "signature": finding.signature,
+        "count": finding.count,
+        "first_crashed_at": finding.first_crashed_at,
+        "last_crashed_at": finding.last_crashed_at,
+    }
+
+
+def format_storm_halt_alert(finding: StormFinding, result: object) -> str:
+    """Render the operator ping for one halt (journald channel)."""
+
+    blocked = getattr(result, "blocked_task_ids", ())
+    failed = getattr(result, "failed_task_ids", ())
+    lines = [
+        "HKRC storm halt: lane halted by crash-storm breaker",
+        f"- {finding.evidence_line}",
+        f"- blocked ready cards: {len(blocked)}"
+        + (f" ({','.join(str(item) for item in blocked)})" if blocked else ""),
+    ]
+    if failed:
+        lines.append(
+            f"- FAILED blocks: {len(failed)} ({','.join(str(item) for item in failed)})"
+        )
+    lines.append(f"- reverse with: hermes kanban --board {finding.board_slug} unblock <task_id>")
+    return "\n".join(lines)
+
+
 def _error_code(state: StreamCursorState) -> str:
     """Return the stable error category from a durable transport record."""
 
@@ -688,6 +808,14 @@ class DaemonRuntime:
         # death events the stream never delivered (see
         # ``StreamObserver.reconcile_blocked_state``).
         reconcile_interval_cycles: int = 0,
+        # Crash-storm breaker (t_df407995): ``storm_check`` is the read-only
+        # detector (returns StormFindings for a tick timestamp); ``storm_halt``
+        # is the constrained applier (blocks ready cards of the finding's
+        # lane).  Both default to the production wiring built from
+        # ``config.native_boards_root`` / ``native_cli``; tests inject fakes.
+        storm_check: Callable[[int], tuple[StormFinding, ...]] | None = None,
+        storm_halt: Callable[[StormFinding], object] | None = None,
+        storm_halt_runner: NativeRunner | None = None,
     ) -> None:
         if poll_interval < 0:
             raise ValueError("poll_interval must not be negative")
@@ -706,6 +834,18 @@ class DaemonRuntime:
         self.reconcile_interval_cycles = int(reconcile_interval_cycles)
         self._cycle_count = 0
         self._blocked_lister = blocked_lister
+        # Crash-storm breaker state (t_df407995): the detector/applier pair
+        # defaults to the production wiring (snapshot-based check over the
+        # configured boards root; CLI block runner); ``_storm_episode_keys``
+        # dedupes so one storm halts exactly once until the signal clears.
+        self._storm_check = storm_check or _default_storm_check(config)
+        self._storm_halt_runner = storm_halt_runner or self.runner or _default_storm_halt_runner(config)
+        self._storm_halt = storm_halt or (
+            lambda finding: _default_storm_halt(
+                finding, config, runner=self._storm_halt_runner
+            )
+        )
+        self._storm_episode_keys: set[str] = set()
         self.stop_event = threading.Event()
         self.logger = logger or logging.getLogger("hkrc.daemon")
         self._wait = wait or self.stop_event.wait
@@ -795,6 +935,14 @@ class DaemonRuntime:
             stop_probe = self.stop_event.is_set
             observed = observer.poll(stop_requested=stop_probe)
             self._cycle_count += 1
+            # Crash-storm breaker (t_df407995): before any further native
+            # work, run the read-only storm check over fresh board
+            # snapshots and halt any storming lane.  A halt blocks the
+            # lane's ready cards so the dispatcher's pick set goes empty;
+            # the handoff below then has nothing new to burn.  Detector or
+            # applier failures are cycle-scoped (never fatal): a storm
+            # check that cannot run must not take the daemon down.
+            self._check_storms()
             reconcile_reserved = 0
             if (
                 self.reconcile_interval_cycles > 0
@@ -848,6 +996,80 @@ class DaemonRuntime:
         from .handoff import _validate_destination
 
         _validate_destination(self.config)
+
+    # --- crash-storm breaker (t_df407995) ---------------------------------
+
+    def _check_storms(self) -> int:
+        """Run the storm detector over board snapshots; halt storming lanes.
+
+        Returns the number of cards blocked by halts this cycle.  Read-only
+        detection is best-effort per board (an unreadable board is logged
+        and skipped); the halt applier is allowlisted inside
+        ``storm_halt.apply_halt`` to block-only on ready cards of the
+        finding's (board, profile) lane.  Findings dedupe per episode (one
+        storm halts once per episode) and every halt logs a structured
+        ``storm_halt`` record carrying the SQL evidence — the audit trail.
+        The operator ping rides the same journald channel as self-health
+        alerts (the 2026-08-11 Telegram mute).
+
+        Episode reconciliation (DEF-t_df407995-2): a dedupe key whose lane
+        is absent from the current tick's findings has its episode ended —
+        the key is dropped, so a fresh storm of the same signature halts
+        again.  An attempted halt that blocks zero cards also does not
+        consume the episode (all-blocks-failed leaves the key unmarked so
+        the next tick retries).
+        """
+
+        if self._storm_check is None or self._storm_halt is None:
+            return 0
+        findings: tuple[StormFinding, ...] = ()
+        try:
+            findings = self._storm_check(self._now())
+        except Exception as exc:  # storm check must never kill the cycle
+            self._log("storm_check_error", error=_safe_error(str(exc), ""))
+            return 0
+        if self.stop_event.is_set():
+            return 0
+        # Episode reconcile: keep only keys still storming this tick.  A
+        # signature that has cleared its window ends the episode; if the
+        # same signature storms again later, it is a new episode.
+        self._storm_episode_keys &= {finding.dedupe_key for finding in findings}
+        halted = 0
+        for finding in findings:
+            if finding.dedupe_key in self._storm_episode_keys:
+                continue
+            try:
+                result = self._storm_halt(finding)
+            except Exception as exc:
+                self._log("storm_halt_error", error=_safe_error(str(exc), ""), **finding_evidence_fields(finding))
+                continue
+            # Only a halt that actually blocked something consumes the
+            # episode: an all-blocks-failed halt retries on the next tick.
+            if not result.blocked_task_ids:
+                continue
+            self._storm_episode_keys.add(finding.dedupe_key)
+            halted += len(result.blocked_task_ids)
+            self._log(
+                "storm_halt",
+                board=finding.board_slug,
+                profile=finding.profile,
+                signature=finding.signature,
+                count=finding.count,
+                first_crashed_at=finding.first_crashed_at,
+                last_crashed_at=finding.last_crashed_at,
+                blocked=len(result.blocked_task_ids),
+                failed=len(result.failed_task_ids),
+                blocked_task_ids=list(result.blocked_task_ids),
+                reason=finding.reason,
+            )
+            # Operator ping through the daemon's journald alert channel; a
+            # failed ping is best-effort and never suppresses the halt.
+            try:
+                self._stream_alert_sender(format_storm_halt_alert(finding, result))
+            except Exception:
+                pass
+        return halted
+
 
     def _observer(self, state: ControllerState) -> StreamObserver:
         if self.stream_observer is not None:

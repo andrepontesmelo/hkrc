@@ -29,6 +29,7 @@ import re
 
 from .persona_matrix import (
     AUTHORITATIVE_ALLOWED_OVERRIDE,
+    FLASH_MODEL_IDS,
     MODEL_FLASH,
     MODEL_LUNA_HIGH,
     MODEL_PRO,
@@ -287,19 +288,24 @@ def _model_tier(model_id: str | None) -> str | None:
 
     The matrix is expressed in tiers (t_49ba1035: developer = flash, senior
     dev = pro; frontend-dev = luna-high, t_545a638a); live configs carry
-    full ids such as ``opencode-go/deepseek-v4-flash``, ``glm-5.3``,
+    full ids such as ``zen13/muse-spark-1.3-contributor-free``,
+    ``opencode-go/deepseek-v4-flash``, ``glm-5.3``,
     ``zai/glm-5.3``, ``virtual/glm-5.3`` or ``cx/gpt-5.6-luna-high``.
     Flash wins first, so a ``-flash`` id never falls through to the pro
-    set (t_a832a269: ``glm-5.3-flash`` stays flash). A GLM pro id is
+    set (t_a832a269: ``glm-5.3-flash`` stays flash). The fleet flash id
+    (t_54060309) names neither tier, so it is recognized via the explicit
+    FLASH_MODEL_IDS set. A GLM pro id is
     recognized in its bare direct-zai, legacy ``zai/``-prefixed, and
     OmniRoute ``virtual/``-prefixed forms (PRO_MODEL_IDS); any other id
-    naming neither tier nor the pro set is unrecognized and therefore
+    naming neither tier nor the flash/pro sets is unrecognized and therefore
     drift — the matrix allows flash, pro, or luna-high only.
     """
     if model_id is None:
         return None
     lowered = model_id.lower()
     if MODEL_FLASH in lowered:
+        return MODEL_FLASH
+    if lowered in FLASH_MODEL_IDS:
         return MODEL_FLASH
     if MODEL_PRO in lowered:
         return MODEL_PRO

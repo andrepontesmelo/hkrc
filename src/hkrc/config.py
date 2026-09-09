@@ -594,6 +594,7 @@ class ControllerConfig:
             f"profiles_root = {_toml_string(self.harness_loop.profiles_root)}  # empty = HKRC_PROFILES_ROOT env, else {DEFAULT_PROFILES_ROOT}\n"
             f"config_drift_allowed_profiles = {_toml_string_array(self.harness_loop.config_drift_allowed_profiles)}  # deliberate model.default pins; empty = flag all divergence\n"
             f"hkrc_repo = {_toml_optional_string(str(self.harness_loop.hkrc_repo) if self.harness_loop.hkrc_repo else None)}\n"
+            f"canonical_branch = {_toml_string(self.harness_loop.canonical_branch)}  # N5 stale-branch baseline ref\n"
             f"analysis_profile = {_toml_string(self.harness_loop.analysis_profile)}  # empty = authoritative analysis disabled\n"
             f"analysis_timeout_seconds = {self.harness_loop.analysis_timeout_seconds}\n"
             f"analysis_max_attempts = {self.harness_loop.analysis_max_attempts}\n"
@@ -606,6 +607,7 @@ class ControllerConfig:
             f"archloop_high_nights = {self.harness_loop.archloop_high_nights}\n"
             f"decision_latency_seconds = {self.harness_loop.decision_latency_seconds}  # machine-blocked defect threshold\n"
             f"decision_latency_human_seconds = {self.harness_loop.decision_latency_human_seconds}  # needs_input waits on Andre; default 7d\n"
+            f"cron_jobs_path = {_toml_string(self.harness_loop.cron_jobs_path)}  # empty = crons.resolve_cron_store_path (native profile / HERMES_HOME / active_profile / default home)\n"
             "\n[assist]\n"
             f"human_in_loop = {'true' if self.assist.human_in_loop else 'false'}\n"
             "\n[outcome_guard]\n"
@@ -828,6 +830,7 @@ def load_config(path: Path) -> ControllerConfig:
         "config_drift_allowed_profiles", []
     )
     harness_loop_hkrc_repo = harness_loop.get("hkrc_repo")
+    harness_loop_canonical_branch = harness_loop.get("canonical_branch", "main")
     harness_loop_analysis_profile = harness_loop.get("analysis_profile", "")
     harness_loop_analysis_timeout = harness_loop.get("analysis_timeout_seconds", 120)
     harness_loop_analysis_max_attempts = harness_loop.get("analysis_max_attempts", 2)
@@ -846,6 +849,7 @@ def load_config(path: Path) -> ControllerConfig:
     harness_loop_archloop_high = harness_loop.get(
         "archloop_high_nights", ARCHLOOP_HIGH_NIGHTS
     )
+    harness_loop_cron_jobs_path = harness_loop.get("cron_jobs_path", "")
     harness_loop_decision_latency = harness_loop.get(
         "decision_latency_seconds", DECISION_LATENCY_SECONDS
     )
@@ -908,6 +912,8 @@ def load_config(path: Path) -> ControllerConfig:
         )
     if harness_loop_hkrc_repo is not None and not isinstance(harness_loop_hkrc_repo, str):
         raise ConfigError("harness_loop hkrc_repo must be a string or null")
+    if not isinstance(harness_loop_canonical_branch, str) or not harness_loop_canonical_branch.strip():
+        raise ConfigError("harness_loop canonical_branch must be a non-empty string")
     if not isinstance(harness_loop_analysis_profile, str):
         raise ConfigError("harness_loop analysis_profile must be a string")
     if (
@@ -946,6 +952,8 @@ def load_config(path: Path) -> ControllerConfig:
         raise ConfigError("harness_loop stale_retention_days must be a positive integer")
     if not isinstance(harness_loop_archloop_output_dir, str):
         raise ConfigError("harness_loop archloop_output_dir must be a string or empty")
+    if not isinstance(harness_loop_cron_jobs_path, str):
+        raise ConfigError("harness_loop cron_jobs_path must be a string or empty")
     if not isinstance(harness_loop_archloop_classes, list) or any(
         not isinstance(skip_class, str) or not skip_class.strip()
         for skip_class in harness_loop_archloop_classes
@@ -1074,6 +1082,7 @@ def load_config(path: Path) -> ControllerConfig:
                 if harness_loop_hkrc_repo
                 else None
             ),
+            canonical_branch=harness_loop_canonical_branch,
             analysis_profile=harness_loop_analysis_profile,
             analysis_timeout_seconds=harness_loop_analysis_timeout,
             analysis_max_attempts=harness_loop_analysis_max_attempts,
@@ -1086,6 +1095,7 @@ def load_config(path: Path) -> ControllerConfig:
             archloop_high_nights=harness_loop_archloop_high,
             decision_latency_seconds=harness_loop_decision_latency,
             decision_latency_human_seconds=harness_loop_decision_latency_human,
+            cron_jobs_path=harness_loop_cron_jobs_path,
         ),
         assist=AssistConfig(human_in_loop=assist_human_in_loop),
         outcome_guard=OutcomeGuardConfig(

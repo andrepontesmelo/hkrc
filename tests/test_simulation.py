@@ -326,6 +326,9 @@ def make_config(
             # dir and would leak real campcli/ynab-pilot findings into the
             # simulation.  A nonexistent dir yields zero findings.
             archloop_output_dir=str(tmp_path / "archloop-output"),
+            # Hermetic pin for the cron self-health store (t_78c47d92):
+            # unset would auto-resolve the operator's real jobs.json.
+            cron_jobs_path=str(tmp_path / "cron" / "jobs.json"),
         ),
         watcher=WatcherConfig(reviewer_profiles=("reviewer",)),
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -46,6 +47,7 @@ def test_install_upgrade_rollback_and_instance_isolation(tmp_path: Path) -> None
     assert (two / "current").is_symlink()
     assert (one / "bin" / "hkrc").stat().st_mode & stat.S_IXUSR
     assert (one / "skills" / "blocker-recovery" / "SKILL.md").is_file()
+    assert (one / "skills" / "friction-flag" / "SKILL.md").is_file()
     # The versioned needs-input-watcher prompt template ships in the release and is
     # seeded into the instance config directory.
     assert (one / "releases" / "1.0.0" / "config" / "hkrc" / "needs-input-watcher-prompt.txt").is_file()
@@ -66,6 +68,38 @@ def test_install_upgrade_rollback_and_instance_isolation(tmp_path: Path) -> None
     assert release("rollback", one, source).returncode == 0
     assert (one / "current").resolve().name == "1.0.0"
     assert (one / "previous").resolve().name == "2.0.0"
+
+
+def test_release_requires_every_shipped_skill_dir(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    copy_source(source)
+    shutil.rmtree(source / "skills" / "friction-flag")
+
+    instance = tmp_path / "instance"
+    result = release("install", instance, source)
+    assert result.returncode == 2
+    assert "friction-flag" in result.stderr
+
+
+def test_friction_flag_skill_matches_approved_contract() -> None:
+    skill = ROOT / "skills" / "friction-flag" / "SKILL.md"
+    text = skill.read_text(encoding="utf-8")
+    assert 'name: friction-flag' in text
+    for trigger in (
+        "blocked twice",
+        "re-ask",
+        "missed skill trigger",
+        "silent failure",
+        "ADHD-contract miss",
+    ):
+        assert trigger in text
+    for severity in ("low", "medium", "high"):
+        assert f"- {severity}:" in text
+    assert "orchestration | tooling | working-agreement | other" in text
+    assert (
+        'HKRC="$HOME/.hermes/hkrc/bin/hkrc"; '
+        '[ -x "$HKRC" ] && "$HKRC" flag --severity <s> --kind <k> --note "<one line>" || true'
+    ) in text
 
 
 def test_two_instance_default_paths_and_state_are_isolated(tmp_path: Path, monkeypatch) -> None:

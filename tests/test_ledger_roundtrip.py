@@ -16,7 +16,12 @@ from hkrc.harness_loop import (
     run,
 )
 
-from test_harness_loop import make_config, make_hkrc_repo, queue_entry
+from test_harness_loop import (
+    make_config,
+    make_hkrc_repo,
+    make_ticket_runner,
+    queue_entry,
+)
 
 NOW = 1_788_000_000
 DAY = 86_400
@@ -194,6 +199,15 @@ def test_round_trip_on_copy_of_real_ledger(tmp_path: Path) -> None:
     resolved_fps = {
         e["fingerprint"] for e in before_of if e.get("fix_status") == "resolved"
     }
+    # Compute eligibility from the copy BEFORE pruning; the live stale
+    # population is time-dependent (a production prune leaves zero entries
+    # past the cutoff until new findings age out), so the removal contract
+    # cannot be asserted unconditionally.
+    eligible_fps = {
+        e["fingerprint"]
+        for e in before_of
+        if e.get("fix_status") == "stale" and e["last_seen"] < cutoff
+    }
     state = load_state(ledger_copy)
     pruned, backup = prune_stale_entries(
         state, ledger_copy, retention_days=14, now=now
@@ -214,16 +228,29 @@ def test_round_trip_on_copy_of_real_ledger(tmp_path: Path) -> None:
         entry = by_fp[fp]
         assert entry["fix_status"] == "stale"
         assert entry["last_seen"] < cutoff
-    # Backup written next to the copy, full 210-entry content.
-    assert backup is not None and backup.is_file() and backup.parent == work
-    backup_state = json.loads(backup.read_text(encoding="utf-8"))
-    assert len(backup_state["open_findings"]) == len(before_of)
+    # Backup written next to the copy, full pre-prune content (only when a
+    # removal actually happened — the product writes no backup for a no-op).
+    if eligible_fps:
+        assert backup is not None and backup.is_file() and backup.parent == work
+        backup_state = json.loads(backup.read_text(encoding="utf-8"))
+        assert len(backup_state["open_findings"]) == len(before_of)
+    else:
+        # No-op contract: nothing eligible -> prune nothing, no backup.
+        # The REMOVAL contract (pruned rows stale+past-cutoff, backup written,
+        # full pre-prune content) stays covered unconditionally by
+        # test_default_retention_not_a_noop_on_real_age_distribution and the
+        # synthetic fixtures above, so this branch does not weaken the suite.
+        assert pruned == 0
+        assert backup is None
+        assert set(fps) == before_fps
     # The live file was never touched.
     live_now = json.loads(REAL_LEDGER.read_text(encoding="utf-8"))
     assert len(live_now["open_findings"]) == len(before_of)
-    # Measured live effect (2026-09-01): 14d prunes 126 of 210 — never zero.
-    stale_count = sum(1 for e in before_of if e.get("fix_status") == "stale")
-    assert 0 < pruned <= stale_count
+    # The live ledger's stale-past-cutoff population is time-dependent (a
+    # production prune empties it, and it refills as findings age out), so
+    # "never zero" is NOT a stable invariant: the removal contract is
+    # exercised when entries are eligible, the no-op contract otherwise.
+    assert pruned == len(eligible_fps)
 
 
 def test_default_retention_not_a_noop_on_real_age_distribution(tmp_path: Path) -> None:
@@ -311,4 +338,68 @@ def test_operator_preview_eight_live_open_entries() -> None:
         _render_wrong(findings, first_seen_by_fp={}, escalation=escalation)
     )
     assert "MEDIUM→HIGH (CHRONIC, 29 nights)" in lines
+
+
+def test_run_dry_run_zero_tickets_and_byte_identical_state(
+    tmp_path: Path,
+) -> None:
+    """Acceptance template (t_ddde2f3a ruling, amended criterion): dry-run
+    routes ZERO tickets and creates ZERO kanban cards (asserted on the
+    router invocation capture), while state-file mutation is expected and
+    limited to LIVE runs — a dry run leaves the file byte-identical.  The
+    deprecated 'hash the live file before/after --dry-run and prove it did
+    not change' gate from t_48fcf459 is replaced by this test: hash
+    invariance is now satisfiable and asserted directly, and router
+    invocations are the routing-truth proof.
+
+    The seeded finding is live-routable (apply_kind=hkrc, before/after
+    still present), so the zero-routing assertion has a positive control:
+    the same ledger routed live by test_harness_loop does create the
+    ticket pair.
+    """
+    import hashlib
+
+    repo = make_hkrc_repo(tmp_path)
+    thing = repo / "src" / "hkrc" / "thing.py"
+    config = make_config(tmp_path, hkrc_repo=repo)
+    entries = [
+        queue_entry(
+            "hkrc-fix:t_route_me",
+            pattern="hkrc-fix",
+            key="t_route_me",
+            severity="high",
+            occurrence_count=1,
+            apply_kind="hkrc",
+            before="OLD_WORD",
+            after="NEW_WORD",
+            target_path=str(thing),
+            verify_path=str(thing),
+            verify_text="OLD_WORD",
+        )
+    ]
+    _open_proof(tmp_path, entries)
+    state_file, _ = _seed(tmp_path, entries)
+    runner, calls, _flags = make_ticket_runner()
+
+    before_hash = hashlib.sha256(state_file.read_bytes()).hexdigest()
+    report = run(
+        config,
+        now=NOW,
+        dry_run=True,
+        state_path=state_file,
+        runner=runner,
+    )
+
+    # Routing truth: zero router invocations -> zero tickets, zero cards.
+    assert calls == [], "dry-run must never invoke the ticket router"
+    # State truth: byte-identical (no last_run refresh, no occ bump, no
+    # queue transition, no prune backup).
+    assert (
+        hashlib.sha256(state_file.read_bytes()).hexdigest() == before_hash
+    ), "dry-run must not mutate the state file"
+    assert not list(state_file.parent.glob("*.backup-*.json"))
+    # The audit half still runs: the carried-open queue item is reported
+    # (story count + labeled carried-open section), just never routed.
+    assert "1 carried-open finding" in report
+    assert "Carried open findings (persisted queue):" in report
 

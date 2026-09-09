@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -13,6 +14,7 @@ import sys
 
 from . import __version__
 from .admission import AdmissionError, admit_child
+from .assist import _normalize_value, _opaque
 from .config import (
     ConfigError,
     ControllerConfig,
@@ -472,13 +474,21 @@ def build_parser() -> argparse.ArgumentParser:
         dest="dry_run",
         action="store_true",
         default=True,
-        help="audit+report only, zero applies (default)",
+        help=(
+            "audit + report only: routes ZERO tickets, creates ZERO kanban "
+            "cards, and leaves the state file byte-identical (default)"
+        ),
     )
     harness_loop_run.add_argument(
         "--no-dry-run",
         dest="dry_run",
         action="store_false",
-        help="allow up to max_applies applied changes (operator review gate)",
+        help=(
+            "allow up to max_applies applied changes (operator review gate); "
+            "LIVE ONLY: persists the state file — last_run refresh, "
+            "occurrence_count +1 on recurring entries, queue transitions, "
+            "and prune-behind-backup"
+        ),
     )
     harness_loop_run.add_argument(
         "--now", type=int, help="override Unix time for deterministic runs and tests"
@@ -641,6 +651,24 @@ def build_parser() -> argparse.ArgumentParser:
     git_hook_status.add_argument("--config", type=Path, default=default_config_path())
     git_hook_status.add_argument("--repo", type=Path, default=Path.cwd())
     git_hook_status.set_defaults(handler=_outcome_guard_git_hook_status)
+
+    flag = subparsers.add_parser(
+        "flag",
+        help="record one inert friction flag in controller state (no trigger, no card, no ping)",
+    )
+    flag.add_argument("--config", type=Path, default=default_config_path())
+    flag.add_argument(
+        "--severity",
+        required=True,
+        choices=("low", "medium", "high"),
+    )
+    flag.add_argument(
+        "--kind",
+        required=True,
+        choices=("orchestration", "tooling", "working-agreement", "other"),
+    )
+    flag.add_argument("--note", required=True)
+    flag.set_defaults(handler=_flag)
     return parser
 
 
@@ -922,6 +950,27 @@ def _status(args: argparse.Namespace) -> int:
         print(f"needs_input_watcher_enabled={str(config.needs_input_watcher.enabled).lower()}")
     finally:
         state.close()
+    return 0
+
+
+def _flag(args: argparse.Namespace) -> int:
+    note = _normalize_value(args.note)
+    if not isinstance(note, str) or not note.strip():
+        print("hkrc: error: --note must not be empty (or redact to empty)", file=sys.stderr)
+        return 2
+    session_id = os.environ.get("HERMES_SESSION_ID", "").strip()
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    config = load_config(args.config)
+    with ControllerState.open_existing(config.state_db) as state:
+        _check_instance(config, state)
+        flag_id = state.record_friction_flag(
+            severity=args.severity,
+            kind=args.kind,
+            note=note,
+            session_ref=_opaque(f"session:{session_id}") if session_id else None,
+            profile_ref=_opaque(f"profile:{profile}") if profile else None,
+        )
+    print(f"flag recorded: id={flag_id} severity={args.severity} kind={args.kind}")
     return 0
 
 

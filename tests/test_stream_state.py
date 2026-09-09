@@ -204,7 +204,7 @@ def test_stream_cursor_rejects_identity_mismatch_in_atomic_commit(tmp_path: Path
 
 def test_stream_state_schema_is_controller_owned(tmp_path: Path) -> None:
     with open_state(tmp_path) as state:
-        assert state.schema_version == 7
+        assert state.schema_version == 8
     with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
         tables = {
             row[0]

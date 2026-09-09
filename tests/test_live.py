@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import stat
 from pathlib import Path
 import socket
 import subprocess
@@ -97,11 +98,21 @@ def test_cli_reader_preserves_nonzero_and_timeout_as_safe_errors() -> None:
         HermesCliCurrentStateReader(runner=timeout_runner)("main", "t_1")
 
 
-def test_live_wiring_reads_only_named_credential_and_creates_one_adapter_per_board(monkeypatch) -> None:
+def _fake_native_cli(tmp_path: Path) -> str:
+    fake = tmp_path / "fake-hermes"
+    fake.write_text("#!/bin/sh\nprintf 'fake-cli-stdout\\n'\n", encoding="utf-8")
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return str(fake)
+
+
+def test_live_wiring_reads_only_named_credential_and_creates_one_adapter_per_board(
+    monkeypatch, tmp_path: Path
+) -> None:
     config = ControllerConfig(
         "test",
         Path("/unused/native"),
         Path("/unused/state"),
+        native_cli=_fake_native_cli(tmp_path),
         stream=StreamConfig(
             enabled=True,
             adapter="approved_websocket",
@@ -120,11 +131,14 @@ def test_live_wiring_reads_only_named_credential_and_creates_one_adapter_per_boa
     assert isinstance(lister, HermesCliBlockedLister)
 
 
-def test_live_wiring_rejects_missing_or_ambiguous_credentials(monkeypatch) -> None:
+def test_live_wiring_rejects_missing_or_ambiguous_credentials(
+    monkeypatch, tmp_path: Path
+) -> None:
     config = ControllerConfig(
         "test",
         Path("/unused/native"),
         Path("/unused/state"),
+        native_cli=_fake_native_cli(tmp_path),
         stream=StreamConfig(
             enabled=True,
             adapter="approved_websocket",
@@ -139,6 +153,40 @@ def test_live_wiring_rejects_missing_or_ambiguous_credentials(monkeypatch) -> No
     monkeypatch.setenv("HKRC_STREAM_AUTH", "opaque")
     with pytest.raises(Exception, match="token or ticket"):
         build_live_stream_wiring(config)
+
+
+def _wiring_config(native_cli: str = "hermes") -> ControllerConfig:
+    return ControllerConfig(
+        "test",
+        Path("/unused/native"),
+        Path("/unused/state"),
+        native_cli=native_cli,
+        stream=StreamConfig(
+            enabled=True,
+            adapter="approved_websocket",
+            endpoint="wss://dashboard.example.test/events",
+            boards=("main",),
+            credential_env="HKRC_STREAM_TICKET",
+            current_state_reader="approved-dashboard-snapshot",
+        ),
+    )
+
+
+def test_native_cli_bare_name_unresolvable_fails_fast(monkeypatch, tmp_path: Path) -> None:
+    empty_dir = tmp_path / "empty-path"
+    empty_dir.mkdir()
+    monkeypatch.setenv("PATH", str(empty_dir))
+    monkeypatch.setenv("HKRC_STREAM_TICKET", "opaque")
+    with pytest.raises(HandoffError, match="native cli 'hermes-nope'.*PATH") as excinfo:
+        build_live_stream_wiring(_wiring_config(native_cli="hermes-nope"))
+    assert str(empty_dir) in str(excinfo.value)
+
+
+def test_native_cli_absolute_path_checked_at_wiring(monkeypatch, tmp_path: Path) -> None:
+    missing = tmp_path / "no-such-hermes"
+    monkeypatch.setenv("HKRC_STREAM_TICKET", "opaque")
+    with pytest.raises(HandoffError, match="not an executable file"):
+        build_live_stream_wiring(_wiring_config(native_cli=str(missing)))
 
 
 def test_websocket_connector_maps_http_auth_failure_without_dependency() -> None:
@@ -174,6 +222,7 @@ def test_live_wiring_discovers_all_non_archived_boards_when_allowlist_empty(
         "test",
         root,
         Path("/unused/state"),
+        native_cli=_fake_native_cli(tmp_path),
         stream=StreamConfig(
             enabled=True,
             adapter="approved_websocket",
@@ -202,6 +251,7 @@ def test_live_wiring_fails_closed_when_no_boards_are_discovered(
         "test",
         root,
         Path("/unused/state"),
+        native_cli=_fake_native_cli(tmp_path),
         stream=StreamConfig(
             enabled=True,
             adapter="approved_websocket",

@@ -90,7 +90,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -228,7 +228,62 @@ RETRY_EXHAUSTION_PATTERN = "retry-exhaustion"
 # exist at all (such a card can never dispatch either).
 SKILL_UNRESOLVABLE_PATTERN = "skill-unresolvable"
 ARCHLOOP_SKIP_STREAK_PATTERN = "archloop-skip-streak"
+# t_129a1a08: daemon-intervention evidence.  An ``outcome=ok`` recovery
+# handoff whose card re-blocked or re-failed within REGRESSION_WINDOW_HOURS
+# is a HIGH finding — the recovery did not hold.  Strictly report-only
+# (apply_kind="none"): the operator decides whether to re-intervene.
+DAEMON_REGRESSION_PATTERN = "daemon-regression"
+REGRESSION_WINDOW_HOURS = 24
+# t_78c47d92: cron self-health.  The daily harness-learning-loop audits 20
+# boards every morning but never read its own scheduler's health — the
+# 2026-09-02 supervisor failure (last_status "error") and the Aug-18
+# six-cron pause wave (all 6 disabled in the same second, undiscovered 8
+# days) both left zero trace in any report.  These are stable
+# Hermes-instance job ids, not derived paths: hardcoded on purpose (the
+# _profiles_root derivation-defect class does not apply to ids).
+CRON_SELF_HEALTH_PATTERN = "cron-self-health"
+# (job id, report label) pairs; match by id — names have drifted before.
+CRON_SELF_HEALTH_WATCHED: tuple[tuple[str, str], ...] = (
+    ("f69651252ba1", "harness-learning-loop"),
+    ("5b3a912e5b3e", "archloop nightly"),
+    ("4efbcd544e56", "needs input watcher"),
+    ("8421219944f7", "review gap watchdog"),
+    ("84393487ea2e", "stale block watch"),
+    ("1369f0027b78", "HKRC harness supervisor"),
+)
 ASSIGNEE_NO_PROFILE_PATTERN = "assignee-no-profile"
+# t_2a1dc07d: advisory N1-N5 detectors (R2 mapping, DETECTOR-NEW).  All five
+# are strictly report-only (apply_kind="none") — HKRC proposes, human decides.
+# Native event kinds referenced: unblocked/completed/promoted (trigger
+# events), completed/cancelled/archived/blocked/gave_up (terminal evidence).
+UNBLOCK_WITHOUT_RECORD_PATTERN = "unblock-without-record"
+COMPLETE_WITHOUT_EVIDENCE_PATTERN = "complete-without-evidence"
+# N2 is scoped to the native hkrc board on purpose (spec: the gateway slice
+# G10 covers only todo-state; this is the hkrc post-hoc slice).
+COMPLETE_WITHOUT_EVIDENCE_BOARD_SLUG = "hkrc"
+ZERO_TERMINAL_CALL_PATTERN = "zero-terminal-call"
+PARENT_LINK_DEADLOCK_PATTERN = "parent-link-deadlock"
+STALE_BRANCH_PATTERN = "stale-branch"
+# N5 fires only at dispatch-admission/unblock events (noise gate) and only
+# when the card's branch is at least this many commits behind the canonical
+# branch.
+STALE_BRANCH_TRIGGER_KINDS = frozenset({"promoted", "unblocked"})
+STALE_BRANCH_BEHIND_THRESHOLD = 5
+# A sha-like token in a completed event payload or task comment counts as
+# commit evidence for N2 (7+ hex chars, word-bounded).
+_COMMIT_REF_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)
+# Events proving a card left the dispatch loop after a run (N3 terminal
+# evidence): an explicit terminal call (completed/cancelled/archived), a
+# kanban_block (blocked), or the breaker's gave_up.
+_TERMINAL_EVIDENCE_EVENT_KINDS = frozenset(
+    {"completed", "cancelled", "archived", "blocked", "gave_up"}
+)
+# task_runs outcome values meaning the run itself succeeded (N3 candidates).
+# The native CLI writes outcome='completed' for a successful run (live
+# vocabulary: completed/spawn_failed/gave_up/timed_out/blocked/reclaimed/
+# crashed/review_requested/scheduled — there is no 'success'); 'success' is
+# kept for controller-written rows per the task spec wording.
+_SUCCESS_RUN_OUTCOMES = frozenset({"completed", "success"})
 _BLOCKED_FAILURE_KINDS = frozenset(
     {
         "blocked",
@@ -253,10 +308,30 @@ _REVIEW_GAP_KIND_TITLE_PREFIXES = (
     "adversary:",
     "archify:",
 )
+# Title prefixes marking work whose expected outcome is NOT a shipped
+# commit (review/planning/QA plus research/spec/spike/scratch "task:" doc
+# work).  Used by N2 (completed events on such cards are exempt from the
+# evidence check) and N4 (such cards are not implementation children).
+# Superset of _REVIEW_GAP_KIND_TITLE_PREFIXES; same case-insensitive
+# prefix + colon-boundary matching.
+_NON_COMMIT_TITLE_PREFIXES = _REVIEW_GAP_KIND_TITLE_PREFIXES + (
+    "research:",
+    "spec:",
+    "spike:",
+    "task:",
+)
 _SEVERITY_ORDER = {"high": 3, "medium": 2, "low": 1}
 # fix_status values that stay in the working set: visible in the report and
 # eligible for the apply budget.  applied/resolved items leave both.
 _OPEN_FIX_STATUSES = frozenset({"open", "deferred"})
+# t_78c47d92: dormant cron-self-health bookkeeping entries.  A day-1 error
+# observation and a recovered (streak-reset) job live in the open_findings
+# ledger — the SAME fingerprint machinery every other detector uses — but
+# carry fix_status="monitor": outside _OPEN_FIX_STATUSES, so they never
+# surface as carried-open findings, never consume ranking or apply budget,
+# and are skipped by the generic revalidation sweep.  The recorder below
+# owns their whole lifecycle.
+_MONITOR_FIX_STATUS = "monitor"
 _STOPWORDS = frozenset(
     {
         "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in",
@@ -364,6 +439,11 @@ class HarnessLoopConfig:
     # over the env so a pinned config cannot be silently redirected.
     profiles_root: str = ""
     hkrc_repo: Path | None = None
+    # N5 stale-branch detector (t_710c0780): the ref every open worktree
+    # card's branch is measured against (read-only rev-list, fail-safe).
+    # Default matches the repo's canonical branch; no config rewrite is
+    # triggered (the key renders on the next operator-approved write).
+    canonical_branch: str = "main"
     # Authoritative analysis stage: a Hermes profile invoked between
     # deterministic evidence collection and the ticket router.  Empty
     # ``analysis_profile`` disables the stage (deterministic routing
@@ -417,6 +497,13 @@ class HarnessLoopConfig:
     # days, so they use decision_latency_human_seconds instead.
     decision_latency_seconds: int | float = DECISION_LATENCY_SECONDS
     decision_latency_human_seconds: int | float = DECISION_LATENCY_HUMAN_SECONDS
+    # Cron self-health store (t_78c47d92).  Empty string = auto: the same
+    # resolution chain ``crons.resolve_cron_store_path`` uses (explicit
+    # native profile, then HERMES_HOME under profiles/, then the sticky
+    # active_profile marker, then the default home).  A missing or
+    # unreadable store yields zero findings and an all-unknown report
+    # section — fail-safe, never fail-loud.
+    cron_jobs_path: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -460,8 +547,14 @@ class HarnessLoopConfig:
             raise HarnessLoopError("harness_loop dist_skills_root must be a non-empty string")
         if not isinstance(self.profiles_root, str):
             raise HarnessLoopError("harness_loop profiles_root must be a string or empty")
+        if not isinstance(self.cron_jobs_path, str):
+            raise HarnessLoopError("harness_loop cron_jobs_path must be a string or empty")
         if self.hkrc_repo is not None and not isinstance(self.hkrc_repo, Path):
             raise HarnessLoopError("harness_loop hkrc_repo must be a path or null")
+        if not isinstance(self.canonical_branch, str) or not self.canonical_branch.strip():
+            raise HarnessLoopError(
+                "harness_loop canonical_branch must be a non-empty string"
+            )
         if not isinstance(self.analysis_profile, str):
             raise HarnessLoopError("harness_loop analysis_profile must be a string")
         if (
@@ -642,6 +735,114 @@ class FailureEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class CommentRow:
+    """One ``task_comments`` row inside the audit window.
+
+    N1/N2 evidence: ``author`` is the native column (actor identity),
+    ``created_at`` epoch seconds, so an unblock-by-actor can be checked for
+    a preceding record-by-same-actor.
+    """
+
+    task_id: str
+    author: str
+    created_at: int
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
+class EventRow:
+    """One ``task_events`` row inside the audit window.
+
+    Native event kinds (unblocked/completed/promoted/...) feed N1, N2 and
+    N5.  ``payload`` is the raw JSON text — event payloads carry fields
+    (author, lock, run_id) the typed columns do not.
+    """
+
+    task_id: str
+    kind: str
+    created_at: int
+    payload: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class BranchPosition:
+    """One open card's branch position vs the canonical branch (N5).
+
+    ``ahead``/``behind`` come from
+    ``git rev-list --left-right --count <branch>...<canonical>``; a branch
+    that could not be measured is simply absent from the evidence.
+    """
+
+    task_id: str
+    branch: str
+    ahead: int
+    behind: int
+
+
+@dataclass(frozen=True, slots=True)
+class ParentEdge:
+    """One ``task_links`` parent->child edge with both cards' state.
+
+    N4 evidence: the structural deadlock check joins the edge to both task
+    rows directly, so statuses come from ``tasks.status`` at snapshot time
+    (not events) and ``*_created_at`` orders which card is the later-stage
+    one (a child created before its parent is a deliberate fan-in, never
+    flagged).
+    """
+
+    parent_id: str
+    parent_title: str
+    parent_status: str
+    parent_workspace_kind: str | None
+    parent_created_at: int | None
+    child_id: str
+    child_title: str
+    child_status: str
+    child_workspace_kind: str | None
+    child_created_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class InterventionRow:
+    """One ``interventions`` row from the controller's own state database.
+
+    Timestamps are ISO-8601 strings exactly as ``hkrc.state._utc_now``
+    writes them (``datetime.now(timezone.utc).isoformat(timespec="seconds")``,
+    e.g. ``2026-09-02T13:23:24+00:00``) — NOT epoch ints.  Every window
+    comparison parses the string with ``datetime.fromisoformat`` and stays
+    in that domain; mixing with Kanban's epoch-int ``created_at``/
+    ``completed_at`` silently returns the wrong window (the call_logs trap).
+    """
+
+    board_slug: str
+    task_id: str
+    phase: str
+    outcome: str | None
+    error: str | None
+    started_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class FrictionFlagRow:
+    """One ``friction_flags`` row from the controller's own state database.
+
+    Written by ``hkrc flag`` (schema 8); timestamps are ISO-8601 strings
+    exactly as ``hkrc.state._utc_now`` writes them — same NOT-epoch
+    discipline as :class:`InterventionRow`.  Read by the daily loop as
+    report-only evidence; the loop never mutates or deletes rows
+    (consumption is the ledger ``last_run`` watermark, not a store write).
+    """
+
+    severity: str
+    kind: str
+    note: str
+    session_ref: str | None
+    profile_ref: str | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChildInfo:
     """One linked child of a done parent, with reviewer assignee HISTORY.
 
@@ -676,6 +877,16 @@ class BoardEvidence:
     # Every non-done, non-archived task row regardless of window (the pin
     # sweep audits dispatchability, which is window-independent).
     open_task_rows: tuple[TaskRow, ...] = ()
+    # N1/N2 evidence: window comments and events (authors + payloads) and
+    # every parent->child link edge joined to both cards' current state
+    # (window-independent — the topology is the finding, not its age).
+    comments: tuple[CommentRow, ...] = ()
+    events: tuple[EventRow, ...] = ()
+    parent_edges: tuple[ParentEdge, ...] = ()
+    # N5 evidence: per open card branch ahead/behind vs the canonical branch,
+    # collected only when the canonical repo is reachable; empty otherwise
+    # (fail-safe — an unreadable repo is never a finding).
+    branch_positions: tuple[BranchPosition, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -762,6 +973,19 @@ class HarnessReport:
     # nights, chronic) for working-set entries past the escalation threshold.
     # Display only — the stored severity and apply_kind are never touched.
     escalation: Mapping[str, tuple[str, str, int, bool]] = field(default_factory=dict)
+    # Daemon-intervention evidence (report-only): one human line per
+    # daemon intervention inside the 24h window, rendered in its own
+    # section.  Evidence only — never a finding on its own.
+    daemon_handoffs: tuple[str, ...] = ()
+    # Cron self-health (t_78c47d92, report-only): one line per watched
+    # job with enabled / last_status / streak info.  Evidence only — the
+    # section renders even when no finding fires.
+    cron_self_health: tuple[str, ...] = ()
+    # Friction flags (t_ec5271e7, report-only): lines revisiting NEW flags
+    # the agent appended since the last live run (ledger ``last_run``
+    # watermark).  Evidence only — no detector, no findings, no escalation;
+    # the loop has no detection mechanism here by design.
+    friction_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1137,6 +1361,27 @@ def _archloop_output_dir(config: "ControllerConfig") -> Path:
     return Path(DEFAULT_ARCHLOOP_OUTPUT_DIR)
 
 
+def _cron_jobs_path(config: "ControllerConfig") -> Path:
+    """Cron store path the self-health detector reads.
+
+    Explicit ``harness_loop.cron_jobs_path`` knob wins, then the same
+    resolution chain ``crons.resolve_cron_store_path`` uses (explicit
+    native profile, then a profiles-layout HERMES_HOME, then the sticky
+    active_profile marker, then the default home).  Never derived from the
+    sessions database path or ``Path.home()`` alone — see ``_profiles_root``
+    and the 2026-08-31 derivation-defect class.  The import is deferred:
+    crons.py imports config at module level and config imports this
+    module, so a top-level import would close a cycle (config ->
+    harness_loop -> crons -> config).
+    """
+    configured = config.harness_loop.cron_jobs_path.strip()
+    if configured:
+        return Path(configured).expanduser()
+    from .crons import resolve_cron_store_path
+
+    return resolve_cron_store_path(config)
+
+
 def _curator_logs_root(config: "ControllerConfig") -> Path:
     """Curator report logs root, derived next to the sessions database."""
     return _resolve_sessions_db(config).parent / "logs" / "curator"
@@ -1387,6 +1632,9 @@ def collect_boards(
     now: int | None = None,
     window_hours: int | float = 24,
     notes: list[str] | None = None,
+    canonical_repo: Path | None = None,
+    canonical_branch: str = "main",
+    runner: ProcessRunner | None = None,
 ) -> tuple[BoardEvidence, ...]:
     """Collect read-only evidence from every non-archived board.
 
@@ -1401,6 +1649,12 @@ def collect_boards(
     ...``) instead of the fail-closed error — genuine read errors still
     fail closed.  The scan itself is evidence-only: no reservations, no
     writes, no native mutation.
+
+    ``canonical_repo``/``canonical_branch`` (t_2a1dc07d, N5): when the
+    canonical checkout is given, every open worktree card's branch is
+    measured against it (read-only ``git rev-list --left-right --count``);
+    positions feed the stale-branch detector.  Unmeasurable branches and
+    repo errors simply omit evidence — never findings.
     """
     current = int(time.time()) if now is None else int(now)
     cutoff = current - int(window_hours * 3600)
@@ -1420,7 +1674,16 @@ def collect_boards(
                     )
                 continue
             with _open_board_snapshot(db_path) as connection:
-                evidences.append(_collect_one_board(board.slug, connection, cutoff))
+                evidences.append(
+                    _collect_one_board(
+                        board.slug,
+                        connection,
+                        cutoff,
+                        canonical_repo=canonical_repo,
+                        canonical_branch=canonical_branch,
+                        runner=runner,
+                    )
+                )
         except BoardNonNativeError as exc:
             if notes is not None:
                 notes.append(f"board non-native/empty — skipped: {board.slug} ({exc})")
@@ -1447,7 +1710,13 @@ def _board_db_is_empty(path: Path) -> bool:
 
 
 def _collect_one_board(
-    slug: str, connection: sqlite3.Connection, cutoff: int
+    slug: str,
+    connection: sqlite3.Connection,
+    cutoff: int,
+    *,
+    canonical_repo: Path | None = None,
+    canonical_branch: str = "main",
+    runner: ProcessRunner | None = None,
 ) -> BoardEvidence:
     """Collect one board's evidence; missing optional tables are skipped.
 
@@ -1609,8 +1878,65 @@ def _collect_one_board(
             for row in blocked_rows
         )
         children = _collect_children(connection, has_runs)
+        has_comments = (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'task_comments'"
+            ).fetchone()
+            is not None
+        )
+        comments: tuple[CommentRow, ...] = ()
+        if has_comments:
+            comment_rows = connection.execute(
+                """
+                SELECT task_id, author, created_at, body
+                  FROM task_comments
+                 WHERE created_at >= ?
+                 ORDER BY created_at ASC, id ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+            comments = tuple(
+                CommentRow(
+                    task_id=str(row["task_id"]),
+                    author=str(row["author"] or ""),
+                    created_at=int(row["created_at"]),
+                    body=str(row["body"] or ""),
+                )
+                for row in comment_rows
+            )
+        # Only the event kinds the N1/N2/N5 detectors consume; heartbeat and
+        # claim noise stays out of the evidence entirely.
+        event_rows = connection.execute(
+            """
+            SELECT task_id, kind, created_at, payload
+              FROM task_events
+             WHERE kind IN ('unblocked', 'completed', 'promoted', 'blocked')
+               AND created_at >= ?
+             ORDER BY created_at ASC, id ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        events = tuple(
+            EventRow(
+                task_id=str(row["task_id"]),
+                kind=str(row["kind"]),
+                created_at=int(row["created_at"]),
+                payload=str(row["payload"]) if row["payload"] else None,
+            )
+            for row in event_rows
+        )
+        parent_edges = _collect_parent_edges(connection)
     except sqlite3.Error as exc:
         raise HarnessLoopError(f"cannot query native board {slug}: {exc}") from exc
+    branch_positions: tuple[BranchPosition, ...] = ()
+    if canonical_repo is not None:
+        branch_positions = _collect_branch_positions(
+            connection,
+            canonical_repo,
+            canonical_branch,
+            runner=runner,
+        )
     return BoardEvidence(
         slug=slug,
         status_counts=status_counts,
@@ -1620,7 +1946,126 @@ def _collect_one_board(
         children=children,
         blocked_rows=blocked,
         open_task_rows=open_task_rows,
+        comments=comments,
+        events=events,
+        parent_edges=parent_edges,
+        branch_positions=branch_positions,
     )
+
+
+def _collect_parent_edges(
+    connection: sqlite3.Connection,
+) -> tuple[ParentEdge, ...]:
+    """Every parent->child link edge joined to both cards' current state."""
+    links_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_links'"
+    ).fetchone()
+    if links_table is None:
+        return ()
+    edge_rows = connection.execute(
+        """
+        SELECT l.parent_id AS parent_id,
+               p.title AS ptitle, p.status AS pstatus,
+               p.workspace_kind AS pws, p.created_at AS pcreated,
+               l.child_id AS child_id,
+               c.title AS ctitle, c.status AS cstatus,
+               c.workspace_kind AS cws, c.created_at AS ccreated
+          FROM task_links AS l
+          JOIN tasks AS p ON p.id = l.parent_id
+          LEFT JOIN tasks AS c ON c.id = l.child_id
+         ORDER BY l.parent_id ASC, l.child_id ASC
+        """
+    ).fetchall()
+    edges: list[ParentEdge] = []
+    for row in edge_rows:
+        if row["cstatus"] is None:
+            continue  # dangling edge: child card gone, nothing to classify
+        edges.append(
+            ParentEdge(
+                parent_id=str(row["parent_id"]),
+                parent_title=str(row["ptitle"] or ""),
+                parent_status=str(row["pstatus"]),
+                parent_workspace_kind=(
+                    str(row["pws"]) if row["pws"] else None
+                ),
+                parent_created_at=(
+                    int(row["pcreated"]) if row["pcreated"] is not None else None
+                ),
+                child_id=str(row["child_id"]),
+                child_title=str(row["ctitle"] or ""),
+                child_status=str(row["cstatus"]),
+                child_workspace_kind=(
+                    str(row["cws"]) if row["cws"] else None
+                ),
+                child_created_at=(
+                    int(row["ccreated"]) if row["ccreated"] is not None else None
+                ),
+            )
+        )
+    return tuple(edges)
+
+
+def _collect_branch_positions(
+    connection: sqlite3.Connection,
+    canonical_repo: Path,
+    canonical_branch: str,
+    *,
+    runner: ProcessRunner | None = None,
+) -> tuple[BranchPosition, ...]:
+    """Ahead/behind for every open worktree card's branch vs the canonical.
+
+    Read-only ``git rev-list --left-right --count``; a branch that cannot
+    be measured (unknown to the canonical repo, repo unreadable) is simply
+    absent — an unreadable evidence source is never a finding.
+    """
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, branch_name
+              FROM tasks
+             WHERE status NOT IN ('done', 'cancelled', 'archived')
+               AND workspace_kind = 'worktree'
+               AND branch_name IS NOT NULL AND branch_name != ''
+             ORDER BY id ASC
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return ()
+    positions: list[BranchPosition] = []
+    for row in rows:
+        branch = str(row["branch_name"] or "").strip()
+        if not branch:
+            continue
+        result = _run(
+            [
+                "git",
+                "-C",
+                str(canonical_repo),
+                "rev-list",
+                "--left-right",
+                "--count",
+                f"{branch}...{canonical_branch}",
+            ],
+            runner=runner,
+        )
+        if result.returncode != 0:
+            continue
+        parts = result.stdout.split()
+        if len(parts) != 2:
+            continue
+        try:
+            ahead, behind = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        positions.append(
+            BranchPosition(
+                task_id=str(row["id"]),
+                branch=branch,
+                ahead=ahead,
+                behind=behind,
+            )
+        )
+    return tuple(positions)
 
 
 def _collect_children(
@@ -1775,6 +2220,201 @@ def _parse_curator_ts(name: str) -> int | None:
     return int(
         datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc).timestamp()
     )
+
+
+def _interventions_db(config: "ControllerConfig") -> Path:
+    """Controller state database the daemon-intervention sweep reads.
+
+    The ``interventions`` table lives in HKRC's OWN state file
+    (``config.state_db``), so zero new config is needed.  Never derived
+    from ``Path.home()`` or the sessions-db path (see ``_profiles_root``
+    and ``_archloop_output_dir``: that class of derivation shipped false
+    positives twice).  ``HKRC_INTERVENTIONS_DB`` exists for test/instance
+    parity with the other sweep knobs; an explicit env value wins.
+    """
+    from_env = os.environ.get("HKRC_INTERVENTIONS_DB", "").strip()
+    if from_env:
+        return Path(from_env).expanduser()
+    return Path(config.state_db)
+
+
+def collect_interventions(
+    state_db_path: Path,
+    *,
+    now: int | None = None,
+    window_hours: int | float = 24,
+) -> tuple[InterventionRow, ...]:
+    """Read daemon interventions updated inside the audit window.
+
+    Read-only against the controller's own SQLite state (``mode=ro`` URI,
+    ``query_only`` pragma — the LIVE database is never opened for write).
+    The window compares the ISO-string ``updated_at`` against the same
+    ISO-8601 domain ``hkrc.state._utc_now`` writes; a missing database,
+    a database without the ``interventions`` table, or an unreadable row
+    yields an empty tuple — never a raise (fail-safe, matching every
+    other collector here).  Rows with unparseable timestamps are skipped,
+    not coerced.
+    """
+    current = int(time.time()) if now is None else int(now)
+    cutoff = datetime.fromtimestamp(current, tz=timezone.utc) - timedelta(
+        hours=window_hours
+    )
+    path = Path(state_db_path)
+    if not path.is_file():
+        return ()
+    uri = f"file:{path}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+    except sqlite3.Error:
+        return ()
+    try:
+        has_table = (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'interventions'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return ()
+        rows = connection.execute(
+            """
+            SELECT board_slug, task_id, phase, outcome, error, started_at, updated_at
+              FROM interventions
+             ORDER BY updated_at ASC, id ASC
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return ()
+    finally:
+        connection.close()
+    interventions: list[InterventionRow] = []
+    for row in rows:
+        try:
+            updated = datetime.fromisoformat(str(row["updated_at"]))
+            started = str(row["started_at"])
+            datetime.fromisoformat(started)
+        except (TypeError, ValueError):
+            continue
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if updated < cutoff:
+            continue
+        interventions.append(
+            InterventionRow(
+                board_slug=str(row["board_slug"]),
+                task_id=str(row["task_id"]),
+                phase=str(row["phase"]),
+                outcome=(str(row["outcome"]) if row["outcome"] is not None else None),
+                error=(str(row["error"]) if row["error"] is not None else None),
+                started_at=started,
+                updated_at=str(row["updated_at"]),
+            )
+        )
+    return tuple(interventions)
+
+
+def collect_friction_flags(
+    state_db_path: Path,
+    *,
+    since: str | None = None,
+    notes: list[str] | None = None,
+) -> tuple[FrictionFlagRow, ...]:
+    """Read agent-appended friction flags newer than ``since`` (report-only).
+
+    Mirrors :func:`collect_interventions` (``mode=ro`` URI, ``query_only``
+    pragma — the LIVE database is never opened for write): a missing
+    database, a database without the ``friction_flags`` table, or an
+    unreadable row yields an empty tuple — never a raise (fail-safe).  The
+    watermark is the harness-loop ledger's ``last_run`` anchor in the same
+    ISO-8601 domain ``hkrc.state._utc_now`` writes; strict ``>`` keeps a
+    row whose ``created_at`` equals the watermark in the NEXT run's window
+    (consumed rows never re-fire).  ``since=None`` (first-ever run, no
+    ledger anchor) reads ALL rows.  When the store cannot be read at all
+    and ``notes`` is given, one explicit "unknown" reason is appended so
+    the report can render the failure instead of a silent "0 new"
+    (silence-masquerading-as-health discipline, matching the cron
+    self-health section).
+    """
+    path = Path(state_db_path)
+    if not path.is_file():
+        if notes is not None:
+            notes.append(f"friction flag store missing: {path}")
+        return ()
+    uri = f"file:{path}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+    except sqlite3.Error:
+        if notes is not None:
+            notes.append(f"friction flag store unreadable: {path}")
+        return ()
+    try:
+        has_table = (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'friction_flags'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            if notes is not None:
+                notes.append("friction flag store has no friction_flags table")
+            return ()
+        if since is None:
+            rows = connection.execute(
+                """
+                SELECT severity, kind, note, session_ref, profile_ref, created_at
+                  FROM friction_flags
+                 ORDER BY created_at ASC, id ASC
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT severity, kind, note, session_ref, profile_ref, created_at
+                  FROM friction_flags
+                 WHERE created_at > ?
+                 ORDER BY created_at ASC, id ASC
+                """,
+                (since,),
+            ).fetchall()
+    except sqlite3.Error:
+        if notes is not None:
+            notes.append("friction flag store query failed")
+        return ()
+    finally:
+        connection.close()
+    flags: list[FrictionFlagRow] = []
+    for row in rows:
+        try:
+            created = datetime.fromisoformat(str(row["created_at"]))
+        except (TypeError, ValueError):
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        flags.append(
+            FrictionFlagRow(
+                severity=str(row["severity"]),
+                kind=str(row["kind"]),
+                note=str(row["note"]),
+                session_ref=(
+                    str(row["session_ref"])
+                    if row["session_ref"] is not None
+                    else None
+                ),
+                profile_ref=(
+                    str(row["profile_ref"])
+                    if row["profile_ref"] is not None
+                    else None
+                ),
+                created_at=str(row["created_at"]),
+            )
+        )
+    return tuple(flags)
 
 
 # --- pattern detectors ------------------------------------------------------
@@ -2546,6 +3186,419 @@ def detect_retry_exhaustion(
     return tuple(findings)
 
 
+def _iso_to_epoch(value: str) -> int | None:
+    """Parse an ISO-8601 timestamp into epoch seconds; None when unparseable.
+
+    Naive strings are interpreted as UTC (the ``_utc_now`` writer always
+    emits tz-aware ``+00:00`` stamps; the fallback keeps hand fixtures
+    honest instead of silently assuming local time).
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def detect_daemon_regression(
+    interventions: Sequence[InterventionRow],
+    boards: Sequence[BoardEvidence],
+    *,
+    now: int,
+    window_hours: int | float = REGRESSION_WINDOW_HOURS,
+) -> tuple[Finding, ...]:
+    """Daemon interventions whose recovery did NOT hold (report-only HIGH).
+
+    One finding per intervention task that received ``outcome=ok`` and then
+    re-blocked (a ``blocked`` row) or re-failed (a ``task_events`` row of
+    ``_BLOCKED_FAILURE_KINDS``) within ``window_hours`` of the
+    intervention's ``updated_at``.  Re-block evidence is read from the
+    boards ALREADY collected this run — current blocked rows (any age, the
+    collector's blocked-rows query is window-independent in task status)
+    plus in-window failure events — and is timestamp-matched against the
+    ISO-string intervention domain (never mixed with Kanban's epoch-int
+    task timestamps; the string/epoch comparison trap).  A card that is
+    currently done/archived with no re-block event emits nothing: the
+    status-blind negative control.  ``apply_kind="none"`` — HKRC reports,
+    the operator decides.
+    """
+    del now  # kept for detector-call symmetry; the window anchors on updated_at
+    reblocks: dict[str, list[tuple[int, str]]] = {}
+    for board in boards:
+        for task_id, _title, blocked_at, _reason, _kind in board.blocked_rows:
+            reblocks.setdefault(task_id, []).append(
+                (int(blocked_at), f"currently blocked on {board.slug}")
+            )
+        for failure in board.failure_events:
+            if failure.kind not in _BLOCKED_FAILURE_KINDS:
+                continue
+            reblocks.setdefault(failure.task_id, []).append(
+                (int(failure.created_at), f"{failure.kind} event on {board.slug}")
+            )
+    window_seconds = int(window_hours * 3600)
+    findings: list[Finding] = []
+    for intervention in interventions:
+        if (intervention.outcome or "").strip() != "ok":
+            continue
+        updated_epoch = _iso_to_epoch(intervention.updated_at)
+        if updated_epoch is None:
+            continue
+        reblock = next(
+            (
+                (event_epoch, detail)
+                for event_epoch, detail in sorted(reblocks.get(intervention.task_id, ()))
+                if 0 <= event_epoch - updated_epoch <= window_seconds
+            ),
+            None,
+        )
+        if reblock is None:
+            continue
+        event_epoch, detail = reblock
+        hours = (event_epoch - updated_epoch) / 3600
+        findings.append(
+            Finding(
+                pattern=DAEMON_REGRESSION_PATTERN,
+                key=intervention.task_id,
+                severity="high",
+                evidence=(
+                    f"card {intervention.task_id} on {intervention.board_slug} "
+                    f"re-blocked {hours:.1f}h after an outcome=ok daemon "
+                    f"handoff completed {intervention.updated_at} "
+                    f"({detail})",
+                ),
+                suggestion=(
+                    "the daemon recovery did not hold: re-examine the "
+                    "blocker before another automated handoff, or take the "
+                    "card over manually"
+                ),
+                apply_kind="none",
+            )
+        )
+    return tuple(findings)
+
+
+def _cron_self_health_streaks(state: dict) -> dict[str, int]:
+    """job id -> consecutive-error observation count from the shared ledger.
+
+    Reads the ``open_findings`` entries the recorder maintains (pattern
+    ``cron-self-health``); ``occurrence_count`` IS the streak.  The scan
+    consults this instead of any parallel state so the escalation rule
+    ("HIGH on the second consecutive daily observation") reads the same
+    numbers the report's ledger publishes.
+    """
+    streaks: dict[str, int] = {}
+    for entry in state.get("open_findings", []):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("pattern", "")) != CRON_SELF_HEALTH_PATTERN:
+            continue
+        job_id = str(entry.get("key", ""))
+        if job_id:
+            streaks[job_id] = int(entry.get("occurrence_count", 0) or 0)
+    return streaks
+
+
+def _cron_self_health_scan(
+    store_path: Path,
+    streaks: Mapping[str, int] | None = None,
+    watched: Sequence[tuple[str, str]] = CRON_SELF_HEALTH_WATCHED,
+) -> tuple[Finding, ...]:
+    """Escalations only: disabled watched jobs and 2nd-consecutive errors.
+
+    Day-1 error observations are deliberately NOT emitted here (the job's
+    own retry may land later the same day and self-heal; e.g. the
+    supervisor at 05:00 after the loop's 03:00 run) — an error escalates
+    only when the ledger streak (``streaks[job_id] >= 1``, i.e. this is
+    at least the second consecutive daily harness-loop observation).
+    Anything unreadable returns zero findings without raising: fail-safe,
+    never fail-loud.
+    """
+    root = Path(store_path)
+    try:
+        with root.open("r", encoding="utf-8-sig") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        # Missing, unreadable, or mid-write store: report nothing this run.
+        return ()
+    jobs = raw.get("jobs", []) if isinstance(raw, dict) else raw
+    if not isinstance(jobs, list):
+        return ()
+    prior = dict(streaks or {})
+    by_id = {
+        str(job.get("id")): job
+        for job in jobs
+        if isinstance(job, dict) and job.get("id") is not None
+    }
+    findings: list[Finding] = []
+    for job_id, label in watched:
+        job = by_id.get(job_id)
+        if job is None:
+            continue
+        if job.get("enabled") is False:
+            findings.append(
+                Finding(
+                    pattern=CRON_SELF_HEALTH_PATTERN,
+                    key=job_id,
+                    severity="high",
+                    evidence=(
+                        f"watched cron job {job_id} ({label}) is enabled=false "
+                        "in the cron store — a disabled watched job needs no "
+                        "streak (Aug-18 pause-wave shape: all six disabled "
+                        "in the same second, undiscovered 8 days)",
+                    ),
+                    suggestion=(
+                        "re-enable the job with the hermes cron CLI or the "
+                        "cronjob tool and confirm the next_run_at it returns"
+                    ),
+                    apply_kind="none",
+                )
+            )
+            continue
+        if job.get("last_status") == "error" and prior.get(job_id, 0) >= 1:
+            findings.append(
+                Finding(
+                    pattern=CRON_SELF_HEALTH_PATTERN,
+                    key=job_id,
+                    severity="high",
+                    evidence=(
+                        f"watched cron job {job_id} ({label}) records "
+                        "last_status=error on the second consecutive daily "
+                        "harness-loop observation — the self-heal window "
+                        "closed without a recovery (last_error: "
+                        f"{str(job.get('last_error') or 'unknown')!r})",
+                    ),
+                    suggestion=(
+                        "inspect the job's cron output directory for the "
+                        "failing run; a died-mid-run job posts no "
+                        "completion message anywhere else"
+                    ),
+                    apply_kind="none",
+                )
+            )
+    return tuple(findings)
+
+
+def record_cron_self_health_streaks(
+    store_path: Path,
+    state: dict,
+    *,
+    now: int,
+    watched: Sequence[tuple[str, str]] = CRON_SELF_HEALTH_WATCHED,
+    detected_fps: frozenset[str] = frozenset(),
+) -> None:
+    """Maintain the per-job error streak in the shared harness-loop ledger.
+
+    Uses the EXISTING ``open_findings`` ledger and fingerprint machinery —
+    ``fingerprint() == "cron-self-health:<job_id>"``; no second state
+    file.  ``occurrence_count`` counts consecutive daily harness-loop
+    observations of ``last_status == "error"`` (a night = one report run,
+    never calendar days, so a loop outage cannot inflate or deflate a
+    streak — same pattern as detect_archloop_skip_streak).
+
+    Rules per watched job:
+    - error this run, no entry  -> day 1: fix_status="monitor" dormant
+      entry (occurrence_count=1).  The job's own retry may still land
+      later today; only the report's Cron self-health section shows it.
+    - error this run, entry     -> occurrence_count += 1; at 2 the streak
+      escalates and the finding becomes visible.
+    - fingerprint already detected this run (``detected_fps``) -> skip:
+      the scan emitted the escalation and ``_upsert_open_finding`` already
+      counted that recurrence; counting it here too would double-bump.
+    - enabled=false             -> streak frozen untouched (the disabled
+      HIGH is immediate; the job cannot self-heal while dark).
+    - recovered or absent (job id gone from a readable store -> no error
+      observation) -> entry marked "monitor" with occurrence_count reset
+      to 0: the streak RESETS, so a phantom escalation cannot carry over
+      to a failure months later.  An UNREADABLE store still returns early
+      without touching any entry (fail-safe).
+
+    Mutates ``state`` in place; persist with ``save_state`` (the caller
+    skips it under --dry-run, which therefore never touches the ledger).
+    """
+    root = Path(store_path)
+    try:
+        with root.open("r", encoding="utf-8-sig") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return
+    jobs = raw.get("jobs", []) if isinstance(raw, dict) else raw
+    if not isinstance(jobs, list):
+        return
+    by_id = {
+        str(job.get("id")): job
+        for job in jobs
+        if isinstance(job, dict) and job.get("id") is not None
+    }
+    open_findings = [
+        dict(entry) for entry in state.get("open_findings", []) if isinstance(entry, dict)
+    ]
+    queue_by_fp = {str(entry.get("fingerprint", "")): entry for entry in open_findings}
+    stamp = datetime.fromtimestamp(int(now), tz=timezone.utc).strftime("%Y-%m-%d")
+    for job_id, label in watched:
+        job = by_id.get(job_id)
+        if job is None:
+            # Absent job on a READABLE store = no error observation: reset
+            # a stale streak exactly like a recovery (phantom-escalation
+            # guard) instead of freezing it open forever.  An unreadable
+            # store already returned early above, so absence here is real.
+            entry = queue_by_fp.get(f"{CRON_SELF_HEALTH_PATTERN}:{job_id}")
+            if entry is not None and int(entry.get("occurrence_count", 0) or 0) != 0:
+                entry["occurrence_count"] = 0
+                entry["fix_status"] = _MONITOR_FIX_STATUS
+                entry["last_seen"] = int(now)
+                entry["revalidated_at"] = int(now)
+                entry["revalidation"] = {
+                    "outcome": "resolved",
+                    "reason": (
+                        f"{label}: job id absent from the cron store "
+                        "(streak reset to 0)"
+                    ),
+                }
+            continue
+        fp = f"{CRON_SELF_HEALTH_PATTERN}:{job_id}"
+        errored = job.get("last_status") == "error"
+        disabled = job.get("enabled") is False
+        entry = queue_by_fp.get(fp)
+        if disabled or fp in detected_fps:
+            # disabled: the immediate HIGH stands on its own, never grow a
+            # streak for a job that cannot run at all.
+            # detected this run: the scan escalated and _upsert_open_finding
+            # already counted the recurrence — a bump here would double it.
+            continue
+        if not errored:
+            if entry is not None and int(entry.get("occurrence_count", 0) or 0) != 0:
+                # Recovered after at least one error observation: reset the
+                # streak to zero instead of carrying a phantom escalation.
+                entry["occurrence_count"] = 0
+                entry["fix_status"] = _MONITOR_FIX_STATUS
+                entry["last_seen"] = int(now)
+                entry["revalidated_at"] = int(now)
+                entry["revalidation"] = {
+                    "outcome": "resolved",
+                    "reason": (
+                        f"{label}: last_status recovered (streak reset to 0)"
+                    ),
+                }
+            continue
+        if entry is None:
+            entry = {
+                "fingerprint": fp,
+                "pattern": CRON_SELF_HEALTH_PATTERN,
+                "key": job_id,
+                "severity": "high",
+                "evidence": [],
+                "suggestion": "",
+                "apply_kind": "none",
+                "first_seen": int(now),
+                "last_seen": int(now),
+                "occurrence_count": 1,
+                "fix_status": _MONITOR_FIX_STATUS,
+            }
+            open_findings.append(entry)
+            queue_by_fp[fp] = entry
+        else:
+            # 0-based bump: a recovered entry sits at count 0, so its next
+            # single error observation must land on 1 (day 1, dormant) —
+            # never straight to 2.
+            entry["occurrence_count"] = int(entry.get("occurrence_count", 0) or 0) + 1
+            entry["last_seen"] = int(now)
+        streak = int(entry.get("occurrence_count", 1) or 1)
+        if streak >= 2:
+            entry["fix_status"] = "open"
+            entry["severity"] = "high"
+            entry["revalidated_at"] = int(now)
+            entry["revalidation"] = {
+                "outcome": "open",
+                "reason": (
+                    f"{label}: last_status=error on {streak} consecutive "
+                    "daily observations"
+                ),
+            }
+        else:
+            entry["fix_status"] = _MONITOR_FIX_STATUS
+            entry["revalidated_at"] = int(now)
+            entry["revalidation"] = {
+                "outcome": "open",
+                "reason": (
+                    f"{label}: error, 1st observation — self-heal window "
+                    f"open, next check after {stamp}"
+                ),
+            }
+    state["open_findings"] = open_findings
+
+
+def _ordinal(count: int) -> str:
+    """1 -> 1st, 2 -> 2nd, 3 -> 3rd, 4 -> 4th (11/12/13 -> th)."""
+    count = max(int(count), 1)
+    if 11 <= count % 100 <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(count % 10, "th")
+    return f"{count}{suffix}"
+
+
+def _cron_self_health_section(
+    store_path: Path,
+    streaks: Mapping[str, int] | None = None,
+    watched: Sequence[tuple[str, str]] = CRON_SELF_HEALTH_WATCHED,
+) -> tuple[str, ...]:
+    """One report line per watched job: enabled, last_status, streak info.
+
+    Errors name which consecutive observation count this is: 1st = the
+    self-heal window is open (no finding tonight), 2nd+ = escalated to a
+    HIGH finding (matching the What's-wrong section).  Unreadable/missing
+    store: every watched job reports "unknown" — silence never masquerades
+    as health.
+    """
+    root = Path(store_path)
+    prior = dict(streaks or {})
+    jobs_by_id: dict[str, dict] = {}
+    try:
+        with root.open("r", encoding="utf-8-sig") as handle:
+            raw = json.load(handle)
+        jobs = raw.get("jobs", []) if isinstance(raw, dict) else raw
+        if isinstance(jobs, list):
+            jobs_by_id = {
+                str(job.get("id")): job
+                for job in jobs
+                if isinstance(job, dict) and job.get("id") is not None
+            }
+    except (OSError, ValueError):
+        jobs_by_id = {}
+    lines: list[str] = []
+    for job_id, label in watched:
+        job = jobs_by_id.get(job_id)
+        if job is None:
+            lines.append(
+                f"• {label}: unknown (job id {job_id} absent or store unreadable)"
+            )
+            continue
+        enabled = job.get("enabled")
+        status = str(job.get("last_status") or "unknown")
+        if enabled is False:
+            lines.append(
+                f"• {label}: disabled, last_status {status} -> HIGH (immediate)"
+            )
+        elif status == "error":
+            streak = prior.get(job_id, 0) + 1
+            if streak >= 2:
+                lines.append(
+                    f"• {label}: error, {_ordinal(streak)} consecutive "
+                    "observation -> HIGH"
+                )
+            else:
+                lines.append(
+                    f"• {label}: error, {_ordinal(streak)} observation "
+                    "(self-heal window open, next check tomorrow) -> HIGH "
+                    "only on the 2nd consecutive observation"
+                )
+        else:
+            lines.append(f"• {label}: enabled, last_status {status}")
+    return tuple(lines)
+
+
 def _is_quoted(text: str, match: re.Match[str]) -> bool:
     """True when the match is a quoted documentation reference.
 
@@ -3010,6 +4063,341 @@ def _extract_model_default(text: str) -> str:
     return ""
 
 
+# --- advisory N1-N5 detectors (t_2a1dc07d) -----------------------------------
+#
+# Five report-only detectors from the R2 mapping (DETECTOR-NEW ranked list,
+# task_comments id 672 on t_9a498249; grill gate t_8fa311b2 decided
+# top-5-first).  Every finding carries apply_kind="none" — HKRC proposes,
+# a human decides.  Evidence is the native board snapshot only (events,
+# comments, links, runs, branch positions); deterministic, stdlib-only.
+
+
+def _event_author(event: EventRow) -> str:
+    """Actor on an unblocked/completed event: payload ``author``, else ''.
+
+    Events written by the native CLI carry no author at all; those are
+    unattributable and the actor-keyed detectors skip them (fail toward
+    not flagging what cannot be attributed).
+    """
+    parsed = _parse_payload(event.payload)
+    if not parsed:
+        return ""
+    author = parsed.get("author")
+    return str(author).strip() if author else ""
+
+
+def detect_unblock_without_record(
+    boards: Sequence[BoardEvidence],
+) -> tuple[Finding, ...]:
+    """N1: unblock event with no preceding comment by the same actor.
+
+    Blind-unblock (unblocking a card without recording what was decided or
+    why) is the most abused primitive in the recovery playbook — the rule
+    is that the decisions comment comes FIRST, and it must live on the
+    card, never only in chat.  An unblock event whose payload names an
+    actor is flagged when the same actor left no comment on that card
+    strictly before the unblock.  Unattributable unblocks (no author in
+    the payload) are skipped: actor-keyed evidence needs an actor.
+    """
+    findings: list[Finding] = []
+    for board in boards:
+        comments_by_task: dict[str, list[CommentRow]] = {}
+        for comment in board.comments:
+            comments_by_task.setdefault(comment.task_id, []).append(comment)
+        for event in board.events:
+            if event.kind != "unblocked":
+                continue
+            author = _event_author(event)
+            if not author:
+                continue
+            prior = any(
+                comment.author == author and comment.created_at < event.created_at
+                for comment in comments_by_task.get(event.task_id, ())
+            )
+            if prior:
+                continue
+            findings.append(
+                Finding(
+                    pattern=UNBLOCK_WITHOUT_RECORD_PATTERN,
+                    key=f"{board.slug}/{event.task_id}",
+                    severity="high",
+                    evidence=(
+                        f"unblocked {event.task_id} on {board.slug} at "
+                        f"{event.created_at} by '{author}' with no earlier "
+                        "comment by the same actor — the unblock decision "
+                        "is recorded nowhere on the card",
+                    ),
+                    suggestion=(
+                        "record the unblock decision as a card comment "
+                        "(what was decided and why) before unblocking; "
+                        "report-only"
+                    ),
+                    apply_kind="none",
+                )
+            )
+    return tuple(findings)
+
+
+def detect_complete_without_evidence(
+    boards: Sequence[BoardEvidence],
+) -> tuple[Finding, ...]:
+    """N2: completed event with no commit ref, no runs, on a commit-kind card.
+
+    Covers the completion-integrity slice gateway G10 does not (post-hoc):
+    a ``completed`` event on board ``hkrc`` for a card whose title marks
+    commit-expected work is flagged when the completion record and the
+    card's window comments carry no sha-like reference AND no
+    ``task_runs`` row exists for the card in the window.  Review/planning/
+    research/spec/spike/``task:`` cards are exempt — their deliverable is
+    a written answer, not a commit.
+    """
+    findings: list[Finding] = []
+    for board in boards:
+        if board.slug != COMPLETE_WITHOUT_EVIDENCE_BOARD_SLUG:
+            continue
+        tasks_by_id = {task.id: task for task in board.tasks_in_window}
+        run_task_ids = {run.task_id for run in board.runs_in_window}
+        comments_by_task: dict[str, list[CommentRow]] = {}
+        for comment in board.comments:
+            comments_by_task.setdefault(comment.task_id, []).append(comment)
+        for event in board.events:
+            if event.kind != "completed":
+                continue
+            task = tasks_by_id.get(event.task_id)
+            title = ((task.title if task else "") or "").strip().lower()
+            if title.startswith(_NON_COMMIT_TITLE_PREFIXES):
+                continue
+            if _COMMIT_REF_RE.search(event.payload or ""):
+                continue
+            if any(
+                _COMMIT_REF_RE.search(comment.body)
+                for comment in comments_by_task.get(event.task_id, ())
+            ):
+                continue
+            if event.task_id in run_task_ids:
+                continue
+            findings.append(
+                Finding(
+                    pattern=COMPLETE_WITHOUT_EVIDENCE_PATTERN,
+                    key=f"{board.slug}/{event.task_id}",
+                    severity="medium",
+                    evidence=(
+                        f"completed {event.task_id} on {board.slug} "
+                        f"('{title or 'untitled'}') with no sha-like commit "
+                        "reference in the completion record or card comments "
+                        "and no task_runs row in the window",
+                    ),
+                    suggestion=(
+                        "re-check the card: done implementation work ships a "
+                        "commit; reference the sha in the completion record "
+                        "or a card comment; report-only"
+                    ),
+                    apply_kind="none",
+                )
+            )
+    return tuple(findings)
+
+
+def detect_zero_terminal_call(
+    boards: Sequence[BoardEvidence],
+) -> tuple[Finding, ...]:
+    """N3: successful run whose card never left the dispatch loop.
+
+    A ``task_runs`` row with a success outcome whose card is STILL open
+    (never done/cancelled/archived) and which has no terminal-call event
+    (completed/cancelled/archived/blocked/gave_up) between the run's start
+    and shortly after its end is the zero-terminal-call protocol
+    violation: the worker exited rc=0 without ever calling
+    kanban_complete or kanban_block.  Terminal evidence BEFORE the run is
+    irrelevant — the question is whether THIS run ended the loop.
+    """
+    findings: list[Finding] = []
+    for board in boards:
+        open_by_id = {task.id: task for task in board.open_task_rows}
+        for run in board.runs_in_window:
+            if run.outcome not in _SUCCESS_RUN_OUTCOMES:
+                continue
+            if run.status not in ("completed", "done"):
+                continue
+            task = open_by_id.get(run.task_id)
+            if task is None:
+                continue
+            run_end = (run.ended_at if run.ended_at is not None else run.started_at) + 60
+            has_terminal = any(
+                event.task_id == run.task_id
+                and event.kind in _TERMINAL_EVIDENCE_EVENT_KINDS
+                and run.started_at - 1 <= event.created_at <= run_end
+                for event in board.events
+            )
+            if has_terminal:
+                continue
+            findings.append(
+                Finding(
+                    pattern=ZERO_TERMINAL_CALL_PATTERN,
+                    key=f"{board.slug}/{run.task_id}",
+                    severity="medium",
+                    evidence=(
+                        f"run {run.id} on {board.slug} for {run.task_id} "
+                        "finished outcome=success but the card is still "
+                        f"{task.status} and no terminal call "
+                        "(completed/cancelled/archived/blocked/gave_up) was "
+                        "recorded around the run",
+                    ),
+                    suggestion=(
+                        "the run's worker never called a terminal "
+                        "instruction; inspect the card, then complete or "
+                        "block it deliberately; report-only"
+                    ),
+                    apply_kind="none",
+                )
+            )
+    return tuple(findings)
+
+
+def detect_parent_link_deadlock(
+    boards: Sequence[BoardEvidence],
+) -> tuple[Finding, ...]:
+    """N4: parent edges that deadlock the finish line (structural).
+
+    Two classes, straight from the R2 mapping N4 gist ("parent edges where
+    child is review-gated impl or later-stage impl chained under earlier
+    impl/review"):
+
+    - Review-gated implementation: a non-terminal worktree implementation
+      child under a non-terminal review-kind parent.  Reviews validate;
+      they never parent implementation, and the open review child keeps
+      the parent from ever completing.
+
+    - Later stage under earlier stage: a non-terminal worktree
+      implementation child under a worktree implementation-or-review-kind
+      parent (the parent itself carries commit-expected work).  Sequencing
+      via parent-links inverts the dependency: the child cannot finish
+      before the parent, and the parent is the earlier stage.  The
+      parent's current status does not matter (a done earlier stage still
+      pins the later one); the child being terminal clears it.  A scratch
+      planning/anchor parent with an impl child is the normal epic shape
+      and never flagged.
+
+    A child created before its parent is a deliberate fan-in and never
+    flagged.  Only worktree-kind implementation children count — planning/
+    research children under gate cards are the normal orchestration shape.
+    A finding per offending edge; key carries both ids.
+    """
+    findings: list[Finding] = []
+    for board in boards:
+        for edge in board.parent_edges:
+            child_title = (edge.child_title or "").strip().lower()
+            parent_title = (edge.parent_title or "").strip().lower()
+            child_is_impl = (
+                edge.child_workspace_kind == "worktree"
+                and not child_title.startswith(_NON_COMMIT_TITLE_PREFIXES)
+            )
+            if not child_is_impl:
+                continue
+            child_open = edge.child_status not in _TERMINAL_TASK_STATUSES
+            if not child_open:
+                continue
+            parent_is_impl_card = (
+                edge.parent_workspace_kind == "worktree"
+                and not parent_title.startswith(_NON_COMMIT_TITLE_PREFIXES)
+            )
+            parent_is_review = (
+                edge.parent_workspace_kind == "worktree"
+                and parent_title.startswith(_REVIEW_GAP_KIND_TITLE_PREFIXES)
+            )
+            parent_open = edge.parent_status not in _TERMINAL_TASK_STATUSES
+            class_a = parent_is_review and parent_open
+            fan_in = (
+                edge.child_created_at is not None
+                and edge.parent_created_at is not None
+                and edge.child_created_at < edge.parent_created_at
+            )
+            class_b = parent_is_impl_card and not fan_in
+            if not (class_a or class_b):
+                continue
+            which = (
+                "review-gated implementation"
+                if class_a
+                else "later stage under earlier stage"
+            )
+            findings.append(
+                Finding(
+                    pattern=PARENT_LINK_DEADLOCK_PATTERN,
+                    key=f"{board.slug}/{edge.child_id}@{edge.parent_id}",
+                    severity="medium",
+                    evidence=(
+                        f"edge {edge.parent_id} ('{edge.parent_title}', "
+                        f"{edge.parent_status}) -> {edge.child_id} "
+                        f"('{edge.child_title}', {edge.child_status}) on "
+                        f"{board.slug}: {which} — parent-links wire an order "
+                        "the completion gate cannot satisfy",
+                    ),
+                    suggestion=(
+                        "re-parent the child (or run it standalone) and "
+                        "express the order with blocked-kind dependencies or "
+                        "comments; never sequence with parent-links; "
+                        "report-only"
+                    ),
+                    apply_kind="none",
+                )
+            )
+    return tuple(findings)
+
+
+def detect_stale_branch(
+    boards: Sequence[BoardEvidence],
+    *,
+    behind_threshold: int = STALE_BRANCH_BEHIND_THRESHOLD,
+) -> tuple[Finding, ...]:
+    """N5: open card's branch far behind the canonical branch at re-entry.
+
+    Runs only for cards that saw a dispatch-admission (``promoted``) or
+    ``unblocked`` event inside the window — the moments work RESUMES, when
+    continuing on a stale branch actually happens; otherwise every old
+    worktree would flag on every run.  Behind-counts come from the
+    collector's read-only ``git rev-list --left-right --count``; a branch
+    with no measured position (unknown to the canonical repo, repo
+    unreadable) is never flagged.
+    """
+    findings: list[Finding] = []
+    for board in boards:
+        if not board.branch_positions:
+            continue
+        positions = {pos.task_id: pos for pos in board.branch_positions}
+        triggered = {
+            event.task_id
+            for event in board.events
+            if event.kind in STALE_BRANCH_TRIGGER_KINDS
+        }
+        for task in board.open_task_rows:
+            if task.id not in triggered:
+                continue
+            pos = positions.get(task.id)
+            if pos is None:
+                continue
+            if pos.behind < behind_threshold:
+                continue
+            findings.append(
+                Finding(
+                    pattern=STALE_BRANCH_PATTERN,
+                    key=f"{board.slug}/{task.id}",
+                    severity="medium",
+                    evidence=(
+                        f"branch {pos.branch} of {task.id} on {board.slug} "
+                        f"is {pos.behind} commits behind the canonical "
+                        f"branch ({pos.ahead} ahead) at a promoted/unblock "
+                        "re-entry event",
+                    ),
+                    suggestion=(
+                        "rebase onto the canonical branch before continuing "
+                        "the work; report-only"
+                    ),
+                    apply_kind="none",
+                )
+            )
+    return tuple(findings)
+
+
 # --- dedupe state machine ---------------------------------------------------
 
 
@@ -3055,6 +4443,13 @@ def _git_log_indicates_fixed(finding: Finding, git_log: str, fp: str) -> bool:
     """
     haystack = (git_log or "").casefold()
     if not haystack:
+        return False
+    if finding.pattern == CRON_SELF_HEALTH_PATTERN:
+        # The escalation's fix is an OPERATOR ACTION (re-enable the job,
+        # inspect the cron output) — never an HKRC commit.  A merged
+        # "feat: cron-self-health detector" commit must not permanently
+        # resolve a live stuck-error escalation; only the ledger's own
+        # recovery rule (streak reset) closes it.
         return False
     if finding.pattern == "review-gap":
         key = (finding.key or "").strip()
@@ -4542,6 +5937,13 @@ _PATTERN_TITLES = {
     "skill-unresolvable": "Unresolvable pinned skill (spawn will fail)",
     "assignee-no-profile": "Assignee has no worker profile (cannot dispatch)",
     "archloop-skip-streak": "Archloop skip streak (nightly refactor not running)",
+    "daemon-regression": "Daemon intervention regression (recovery did not hold)",
+    "cron-self-health": "Cron self-health (watched job disabled or stuck in error)",
+    "unblock-without-record": "Unblock without a recorded decision",
+    "complete-without-evidence": "Completed without shipped evidence",
+    "zero-terminal-call": "Worker run ended without a terminal call",
+    "parent-link-deadlock": "Parent-link sequencing deadlock",
+    "stale-branch": "Branch far behind the canonical branch at re-entry",
 }
 
 # Wait-what problem prose per pattern: plain-English description, no codes,
@@ -4563,6 +5965,12 @@ _PATTERN_PROBLEMS: dict[str, str] = {
     "skill-unresolvable": "A card pins a force-loaded skill no worker profile can resolve, so its dispatch will crash or degrade.",
     "assignee-no-profile": "A card is assigned to a worker profile that does not exist, so it can never dispatch.",
     "archloop-skip-streak": "The archloop nightly refactor has skipped a repo for consecutive report nights, so refactoring silently stopped.",
+    "daemon-regression": "A card that a daemon handoff recovered re-blocked or re-failed, so the recovery did not hold.",
+    "unblock-without-record": "A blocked card was unblocked without a decision comment recorded on the card by the same actor.",
+    "complete-without-evidence": "A card was marked done with no commit reference in the completion record or comments and no run trace.",
+    "zero-terminal-call": "A worker run finished successfully but never issued a terminal instruction on its card.",
+    "parent-link-deadlock": "A card is parent-linked under a review or earlier-stage card, wiring an order the completion gate cannot satisfy.",
+    "stale-branch": "A resumed card's branch is many commits behind the canonical branch.",
 }
 
 # Human-form recommended solutions, keyed by the exact suggestion text the
@@ -4980,6 +6388,21 @@ def render_report(report: HarnessReport) -> str:
         lines.extend(f"• {item}" for item in report.right)
     else:
         lines.append("• none")
+    lines += ["", "Daemon handoffs (last 24h, report-only)"]
+    if report.daemon_handoffs:
+        lines.extend(f"• {item}" for item in report.daemon_handoffs)
+    else:
+        lines.append("• none")
+    lines += ["", "Cron self-health (6 watched jobs, report-only)"]
+    if report.cron_self_health:
+        lines.extend(f"• {item}" for item in report.cron_self_health)
+    else:
+        lines.append("• none")
+    lines += ["", "Session friction flags (new since last run, report-only)"]
+    if report.friction_flags:
+        lines.extend(f"• {item}" for item in report.friction_flags)
+    else:
+        lines.append("• none")
     lines += ["", "Next action (under 2 min)", report.next_action]
     return "\n".join(lines)
 
@@ -4993,8 +6416,17 @@ def _detect_all(
     log_text: str,
     current: int,
     config: "ControllerConfig",
+    interventions: Sequence[InterventionRow] = (),
+    state: dict | None = None,
 ) -> tuple[Finding, ...]:
-    """Run every detector; deterministic, stdlib-only."""
+    """Run every detector; deterministic, stdlib-only.
+
+    ``state`` (the loaded harness-loop ledger) feeds the cron self-health
+    scan's streak rule — an error HIGH fires only when the prior ledger
+    already counted one consecutive observation.  Optional so positional
+    callers (simulation, older tests) keep working; ``None`` means
+    "no ledger history" (every error is a day-1 observation).
+    """
     findings: list[Finding] = []
     findings.extend(detect_reask(sessions))
     findings.extend(
@@ -5034,6 +6466,21 @@ def _detect_all(
             high_nights=config.harness_loop.archloop_high_nights,
         )
     )
+    findings.extend(
+        detect_daemon_regression(interventions, boards, now=current)
+    )
+    # t_2a1dc07d: advisory N1-N5, all report-only.
+    findings.extend(detect_unblock_without_record(boards))
+    findings.extend(detect_complete_without_evidence(boards))
+    findings.extend(detect_zero_terminal_call(boards))
+    findings.extend(detect_parent_link_deadlock(boards))
+    findings.extend(detect_stale_branch(boards))
+    findings.extend(
+        _cron_self_health_scan(
+            _cron_jobs_path(config),
+            _cron_self_health_streaks(state or {}),
+        )
+    )
     return tuple(findings)
 
 
@@ -5063,6 +6510,48 @@ def _skipped_lines(state: dict) -> tuple[str, ...]:
     for line in list(counts)[:5]:
         count = counts[line]
         lines.append(f"{line} (x{count})" if count > 1 else line)
+    return tuple(lines)
+
+
+def _friction_flag_lines(
+    flags: Sequence[FrictionFlagRow],
+    *,
+    unknown_note: str = "",
+) -> tuple[str, ...]:
+    """Humanize new friction flags for the report-only section.
+
+    Renders a total + by-severity + by-kind summary line, then one line
+    per distinct note with identical notes collapsed via ``(xN)``
+    (precedent ``_skipped_lines``).  Unreadable-store runs render the
+    explicit ``unknown`` reason instead of a silent "0 new"; a readable
+    store with zero new rows renders "0 new" — consumption proof, never
+    silence (grilling t_21b774b5 amendment: report-only, the loop only
+    REVISITS flags).
+    """
+    if unknown_note:
+        return (f"unknown — {unknown_note}",)
+    if not flags:
+        return ("0 new",)
+    by_severity: dict[str, int] = {}
+    by_kind: dict[str, int] = {}
+    note_counts: dict[str, int] = {}
+    for flag in flags:
+        by_severity[flag.severity] = by_severity.get(flag.severity, 0) + 1
+        by_kind[flag.kind] = by_kind.get(flag.kind, 0) + 1
+        note = f"[{flag.severity}] {flag.kind}: {flag.note}"
+        note_counts[note] = note_counts.get(note, 0) + 1
+    severity_text = ", ".join(
+        f"{severity} x{by_severity[severity]}"
+        for severity in ("high", "medium", "low")
+        if severity in by_severity
+    )
+    kind_text = ", ".join(
+        f"{kind} x{by_kind[kind]}" for kind in sorted(by_kind)
+    )
+    lines = [f"{len(flags)} new (severity: {severity_text}; kind: {kind_text})"]
+    for note in list(note_counts)[:5]:
+        count = note_counts[note]
+        lines.append(f"{note} (x{count})" if count > 1 else note)
     return tuple(lines)
 
 
@@ -5154,8 +6643,16 @@ def run(
     Returns the rendered report text; "" when ``harness_loop`` is
     disabled.  Read-only against sessions and boards (boards are read from
     temp snapshots, snapshot failures recorded as evidence); the only
-    controller-owned mutations are the atomic state file and, in live mode
-    only, the ticket router's kanban card creation on board ``hkrc``.
+    controller-owned mutation is the ticket router's kanban card creation
+    on board ``hkrc``, and only in live mode (``dry_run=False``).
+
+    Dry-run contract (``dry_run=True``, the CLI default): routes zero
+    tickets and creates zero kanban cards, and the state file is left
+    byte-identical — ``last_run``, ``occurrence_count``, and queue
+    transitions persist on live runs only (the cron shim flips
+    ``--no-dry-run`` after operator review).  Consequence: a dry run never
+    bumps the escalation ladder; severity escalation is driven by the
+    occurrence counts accumulated by approved live runs.
 
     ``trace`` is an optional list the simulation layer passes in: one
     structured facts dict is appended (counts, analysis outcome, applied
@@ -5189,21 +6686,65 @@ def run(
             now=current,
             window_hours=window_hours,
             notes=notes,
+            canonical_repo=hkrc_repo,
+            canonical_branch=config.harness_loop.canonical_branch,
+            runner=runner,
         )
     except HarnessLoopError as exc:
         notes.append(f"boards fail-closed: {exc}")
 
     curator = collect_curator_reports(_curator_logs_root(config), now=current)
 
+    interventions: tuple[InterventionRow, ...] = ()
+    try:
+        interventions = collect_interventions(
+            _interventions_db(config),
+            now=current,
+            window_hours=window_hours,
+        )
+    except (HarnessLoopError, OSError, sqlite3.Error) as exc:
+        # The collector is fail-safe internally; this guard only keeps a
+        # future regression from killing the whole nightly report.
+        notes.append(f"interventions unreadable (fail-safe): {exc}")
+
     state = load_state(state_file)
     last_run = state.get("last_run")
+    # Friction flags (report-only, t_ec5271e7): NEW rows since the ledger's
+    # last-run anchor (epoch int -> the same ISO-8601 domain _utc_now
+    # writes).  No ledger anchor (first run) reads ALL rows.  Fail-safe:
+    # an unreadable store appends an explicit unknown reason — never a
+    # raise, never a silent "0 new".
+    friction_since = (
+        None
+        if not last_run
+        else datetime.fromtimestamp(int(last_run), tz=timezone.utc).isoformat()
+    )
+    friction_flags: tuple[FrictionFlagRow, ...] = ()
+    friction_notes: list[str] = []
+    try:
+        friction_flags = collect_friction_flags(
+            _interventions_db(config),
+            since=friction_since,
+            notes=friction_notes,
+        )
+    except (HarnessLoopError, OSError, sqlite3.Error) as exc:
+        friction_notes.append(f"friction flag store fail-safe: {exc}")
+    friction_until = datetime.fromtimestamp(current, tz=timezone.utc).isoformat()
     log_text = ""
     try:
         log_text = git_log_since(hkrc_repo, int(last_run) if last_run else current, runner=runner)
     except HarnessLoopError as exc:
         notes.append(f"git log unavailable: {exc}")
 
-    findings = _detect_all(sessions, boards, log_text, current, config)
+    findings = _detect_all(
+        sessions,
+        boards,
+        log_text,
+        current,
+        config,
+        interventions=interventions,
+        state=state,
+    )
     fresh, updated = dedupe(
         findings,
         state,
@@ -5333,8 +6874,20 @@ def run(
             retention_days=config.harness_loop.stale_retention_days,
             now=current,
         )
+        # Cron self-health streak ledger (t_78c47d92): day-1 error
+        # observations, streak bumps, and recovery resets persist with the
+        # SAME save_state call as every other ledger transition.  Skipped
+        # under --dry-run: an operator preview never touches the ledger.
+        # detected_fps: fingerprints the scan escalated this run were
+        # already counted by _upsert_open_finding — the recorder must not
+        # bump them again (double-count bug, caught in review tracing).
+        record_cron_self_health_streaks(
+            _cron_jobs_path(config),
+            updated,
+            now=current,
+            detected_fps=frozenset(fingerprint(f) for f in findings),
+        )
         save_state(state_file, updated)
-
     analysis_story = {
         "ok": f"analysis ok ({len(analysis.proposals)} proposal(s))",
         "disabled": "analysis disabled",
@@ -5445,6 +6998,32 @@ def run(
     escalation_map = _escalation_map(
         updated.get("open_findings", []), config=config
     )
+    # Daemon-intervention evidence lines (report-only): one per handoff in
+    # the window.  Times are the raw ISO-8601 ``updated_at`` stamps the
+    # daemon writes (UTC, second precision) — the same string domain the
+    # regression detector matches on, never reformatted through a second
+    # timezone conversion.
+    daemon_lines = tuple(
+        f"{row.task_id} outcome={row.outcome or 'unknown'} at "
+        f"{row.updated_at} ({row.phase} phase, {row.board_slug} board)"
+        for row in interventions
+    )
+    cron_self_health_lines = _cron_self_health_section(
+        _cron_jobs_path(config), _cron_self_health_streaks(state)
+    )
+    # Friction-flag section lines: an unreadable store renders its explicit
+    # unknown reason; a readable store renders per-flag lines (xN-collapsed)
+    # or the "0 new" consumption proof.
+    friction_lines = _friction_flag_lines(
+        friction_flags, unknown_note=(friction_notes[0] if friction_notes else "")
+    )
+    friction_by_severity: dict[str, int] = {}
+    friction_by_kind: dict[str, int] = {}
+    for flag in friction_flags:
+        friction_by_severity[flag.severity] = (
+            friction_by_severity.get(flag.severity, 0) + 1
+        )
+        friction_by_kind[flag.kind] = friction_by_kind.get(flag.kind, 0) + 1
     report = HarnessReport(
         story=story,
         wrong=wrong,
@@ -5458,6 +7037,9 @@ def run(
         carried_fps=carried_fps,
         first_seen_by_fp=first_seen_by_fp,
         escalation=escalation_map,
+        daemon_handoffs=daemon_lines,
+        cron_self_health=cron_self_health_lines,
+        friction_flags=friction_lines,
     )
     if trace is not None:
         trace.append(
@@ -5465,6 +7047,17 @@ def run(
                 "window_hours": window_hours,
                 "sessions_count": len(sessions),
                 "boards_count": len(boards),
+                "branch_positions_count": sum(
+                    len(board.branch_positions) for board in boards
+                ),
+                "interventions_count": len(interventions),
+                "friction_flags": {
+                    "since": friction_since,
+                    "until": friction_until,
+                    "new_total": len(friction_flags),
+                    "by_severity": friction_by_severity,
+                    "by_kind": friction_by_kind,
+                },
                 "fresh_count": len(fresh),
                 "carried_open": carried_open,
                 "analysis_status": analysis.status,
@@ -5509,6 +7102,7 @@ __all__ = [
     "HarnessLoopConfig",
     "HarnessLoopError",
     "HarnessReport",
+    "InterventionRow",
     "ProcessResult",
     "ProcessRunner",
     "RunRow",
@@ -5521,26 +7115,38 @@ __all__ = [
     "build_analysis_prompt",
     "collect_boards",
     "collect_curator_reports",
+    "collect_interventions",
     "collect_sessions",
+    "CRON_SELF_HEALTH_PATTERN",
+    "CRON_SELF_HEALTH_WATCHED",
     "dedupe",
     "default_state_path",
     "detect_bloat",
     "detect_config_drift",
+    "detect_daemon_regression",
     "detect_decision_latency",
+    "detect_complete_without_evidence",
     "detect_fix_chain",
     "detect_outage_latency",
+    "detect_parent_link_deadlock",
     "detect_reask",
     "detect_review_pair_gap",
     "detect_review_required_loop",
     "detect_retry_exhaustion",
     "detect_skill_contradictions",
+    "detect_stale_branch",
+    "detect_unblock_without_record",
     "detect_unresolvable_skill_pin",
+    "detect_zero_terminal_call",
+    "FrictionFlagRow",
+    "collect_friction_flags",
     "fingerprint",
     "git_log_since",
     "load_state",
     "parse_git_log",
     "prune_stale_entries",
     "rank_open_findings",
+    "record_cron_self_health_streaks",
     "render_report",
     "revalidate_open_findings",
     "retry_exhaustion_census",

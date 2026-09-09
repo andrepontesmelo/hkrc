@@ -411,7 +411,7 @@ def test_schema_v3_database_upgrades_to_v5_with_episode_columns(tmp_path: Path) 
     connection.close()
 
     with ControllerState.initialize(db, "self-health-test") as state:
-        assert state.schema_version == 7
+        assert state.schema_version == 8
         upgraded = state.get_stream_cursor("alpha")
         assert upgraded.cursor == 42
         assert upgraded.identity == "gen-a"
@@ -472,7 +472,7 @@ def test_schema_v4_database_upgrades_to_v5_with_alert_attempted_column(
     connection.close()
 
     with ControllerState.initialize(db, "self-health-test") as state:
-        assert state.schema_version == 7
+        assert state.schema_version == 8
         upgraded = state.get_stream_cursor("alpha")
         # The v4 episode fields survive the upgrade untouched; the new column
         # defaults to false for the in-flight episode.
