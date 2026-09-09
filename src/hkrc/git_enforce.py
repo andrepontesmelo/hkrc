@@ -37,6 +37,7 @@ PROTECTED_REF_DEFAULT = "refs/heads/main"
 HOOK_MARKER = "# hkrc-managed outcome-guard reference-transaction hook"
 ORIG_SUFFIX = ".hkrc-orig"
 _OID = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+_SYMREF = re.compile(r"^ref:\S+$")
 
 
 class GitEnforceError(RuntimeError):
@@ -75,8 +76,11 @@ def parse_reference_transaction(lines: list[str]) -> tuple[RefUpdate, ...]:
     Real Git 2.43 transactions may also carry pseudo-ref lines (``HEAD``,
     ``ORIG_HEAD``, ``FETCH_HEAD``, ...) whose names never start with ``refs/``
     and therefore can never match a configured protected ref; they are carried
-    through and simply never deny. Object-id format and field count are still
-    validated strictly so garbage input fails closed.
+    through and simply never deny. Git 2.55 additionally reports symbolic-ref
+    updates (``git checkout -b``), whose old/new field is ``ref:<refname>``
+    while the ref field is the symref itself (``HEAD``) - also never a
+    protected ref. Object-id/symref format and field count are still validated
+    strictly so garbage input fails closed.
     """
 
     updates: list[RefUpdate] = []
@@ -88,10 +92,14 @@ def parse_reference_transaction(lines: list[str]) -> tuple[RefUpdate, ...]:
         if len(fields) != 3:
             raise GitEnforceError(f"expected '<old> <new> <ref>' tuple, got: {line!r}")
         old, new, ref = fields
-        if not _OID.fullmatch(old) or not _OID.fullmatch(new):
+        if not _oid_or_symref(old) or not _oid_or_symref(new):
             raise GitEnforceError(f"non-object-id in reference tuple: {line!r}")
         updates.append(RefUpdate(old=old, new=new, ref=ref))
     return tuple(updates)
+
+
+def _oid_or_symref(value: str) -> bool:
+    return bool(_OID.fullmatch(value) or _SYMREF.fullmatch(value))
 
 
 def evaluate_transaction(

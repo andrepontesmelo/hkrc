@@ -100,6 +100,14 @@ def test_parse_valid_tuples_and_pseudo_refs() -> None:
     assert [u.ref for u in updates] == ["refs/heads/main", "refs/heads/feature", "HEAD"]
 
 
+def test_parse_accepts_git255_symref_updates() -> None:
+    """Git 2.55 reports `git checkout -b` as a symref tuple: ref:<name> HEAD."""
+    updates = parse_reference_transaction([f"{ZERO} ref:refs/heads/feature HEAD"])
+    assert [(u.old, u.new, u.ref) for u in updates] == [
+        (ZERO, "ref:refs/heads/feature", "HEAD")
+    ]
+
+
 def test_parse_fails_closed_on_malformed_input() -> None:
     with pytest.raises(GitEnforceError, match="expected"):
         parse_reference_transaction(["single-token\n"])
@@ -118,6 +126,18 @@ def test_non_protected_refs_pass_without_state(tmp_path: Path) -> None:
     )
     assert decision.allowed is True
     assert decision.reason_code == "no_protected_refs"
+
+
+def test_symref_update_never_denies(tmp_path: Path) -> None:
+    """Git 2.55 `checkout -b` tuple targets HEAD, never a protected ref."""
+    state, _ = open_guard(tmp_path)
+    config = ControllerConfig("gate2-git", tmp_path / "boards", state.path)
+    decision = evaluate_transaction(
+        state,
+        config,
+        parse_reference_transaction([f"{ZERO} ref:refs/heads/feature HEAD\n"]),
+    )
+    assert decision.allowed is True
 
 
 def test_protected_ref_denied_without_authorization(tmp_path: Path) -> None:
