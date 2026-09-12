@@ -19,7 +19,9 @@ improvement. HKRC exists so the problems and inefficiencies observed on a board 
 
 The endgame is deliberate: ideally Hermes Kanban shouldn't need a sidecar at all. Fixes
 and improvements should land in Hermes source so the sidecar becomes unnecessary — but
-even then, looking back and reflecting always adds value.
+even then, looking back and reflecting always adds value. Which catalogued corner case
+maps to which upstream Hermes fix, and what must be true before each watchdog is
+retired, is tracked in [docs/upstream-mapping.md](docs/upstream-mapping.md).
 
 ## What it does
 
@@ -53,6 +55,11 @@ unprotected canonical-ref updates.
 collects metrics on the previous day's executions and makes a single LLM request proposing
 improvements to the orchestration workflow. The goal is not to fix tasks directly — it's
 to expand the catalogued corner-case layer so what went wrong doesn't repeat.
+
+One diagram covers both halves: the everyday watcher tick (observe → decide → act), and
+the nightly harness loop that produces the daily reflection report:
+
+![Watcher tick (observe, decide, act) and the daily reflection report](docs/images/watcher-tick.png)
 
 **Configuration is two lines**: the model for the LLM reflection, and the time of day it
 runs. That's it.
@@ -97,7 +104,7 @@ resolves the default branch at install time — pin a tag for reproducibility.
 Useful commands once installed:
 
 ```bash
-uv run pytest        # full suite — currently 1062 tests
+uv run pytest        # full suite
 hkrc --help          # every command (init/status/discover/run/daemon/…/flag)
 ```
 
@@ -126,9 +133,10 @@ when a fix is verified merged into the canonical branch (`git merge-base
 --is-ancestor`, never a claimed SHA), completes the original review and
 promotes any gated children.
 
-![Watcher tick — observe then act](docs/images/watcher-cycle.png)
-
-> PLACEHOLDER observe-then-act — mock drafted from documented example values; swap for a real capture at review.
+The tick itself is one pass of the upper lane in the diagram under
+[What it does](#what-it-does): observe each board's event backlog and current
+state, decide against the catalogued corner cases, and act — or skip,
+fail-closed.
 
 ## Session friction flags (`friction-flag` skill)
 
@@ -152,11 +160,10 @@ classified defects and a graded improvement digest. `hkrc harness-loop run
 --config <config.toml>` (ports the legacy `f69651252ba1` cron job). Start with
 `--dry-run`: the loop writes its plan and escalations without dispatching until
 you flip it on. The verbatim prompt lives in
-[references/harness-loop-prompt.md](references/harness-loop-prompt.md).
-
-![Daily reflection output](docs/images/daily-reflection.png)
-
-> PLACEHOLDER daily-reflection — mock drafted from documented example values; swap for a real capture at review.
+[references/harness-loop-prompt.md](references/harness-loop-prompt.md). The
+pass is the lower lane of the same diagram — the report it renders is the
+daily reflection, delivered through cron (Telegram) with silence when there
+is nothing new.
 
 ## Deep dives
 
@@ -178,7 +185,7 @@ Security issues: [SECURITY.md](SECURITY.md) (do not open a public issue).
 ## Test
 
 ```bash
-uv run pytest        # full suite — currently 1062 tests
+uv run pytest        # full suite
 ```
 
 ## License

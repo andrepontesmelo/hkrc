@@ -86,7 +86,7 @@ def test_flag_happy_path_writes_one_scrubbed_row(tmp_path: Path, monkeypatch) ->
     monkeypatch.setenv("HERMES_SESSION_ID", "session-abc")
     monkeypatch.setenv("HERMES_PROFILE", "developer")
 
-    note = "  deploy  script  touched /home/example-user/.config/secrets.env  twice  "
+    note = "  deploy  script  touched /home/andre/.config/secrets.env  twice  "
     assert main(_flag_argv(config_path, "medium", "tooling", note)) == 0
 
     rows = _flag_rows(tmp_path / "controller.sqlite3")

@@ -13,6 +13,10 @@ Reconciliation rules (deterministic and idempotent):
 - A manifest job whose live match differs on schedule / no_agent / script /
   delivery / skills is edited to the manifest state.  Prompt text is not
   compared (it is descriptive; the manifest only seeds it at create time).
+  A ``{manifest_dir}`` placeholder in a prompt is materialized to the
+  manifest's own directory at load time, so the shipped manifest stays
+  portable while the stored prompt stays absolute (DEF-001: cron agents run
+  with a profile-scoped ``$HOME`` and no cwd contract).
 - Live jobs not named in the manifest are never touched.
 
 The sync prints one line per planned action and is silent when in sync.
@@ -76,8 +80,22 @@ def default_manifest_path(config_path: Path) -> Path:
     return Path(config_path).expanduser().parent / CRON_MANIFEST_FILENAME
 
 
+def _materialize_prompt(prompt: str, manifest_path: Path) -> str:
+    """Materialize manifest-relative placeholders in a seeded prompt.
+
+    ``{manifest_dir}`` becomes the absolute directory that ships the
+    manifest (the supervisor mission file lives next to it).  Substitution
+    happens at load time so the stored cron prompt is absolute: cron agents
+    run with a profile-scoped ``$HOME``, so a tilde path would resolve to a
+    nonexistent file on every tick (DEF-001), and neither tilde nor a bare
+    relative path carries a cwd contract.
+    """
+    return prompt.replace("{manifest_dir}", str(manifest_path.resolve().parent))
+
+
 def load_manifest(path: Path) -> list[ManifestJob]:
-    """Parse and validate the cron manifest JSON file."""
+    """Parse and validate the cron manifest JSON file, materializing any
+    ``{manifest_dir}`` prompt placeholders."""
     path = Path(path).expanduser()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -112,7 +130,9 @@ def load_manifest(path: Path) -> list[ManifestJob]:
                 no_agent=bool(entry.get("no_agent", False)),
                 deliver=str(entry.get("deliver") or "local").strip(),
                 script=str(script).strip() if script else None,
-                prompt=str(prompt).strip() if prompt else None,
+                prompt=(
+                    _materialize_prompt(str(prompt).strip(), path) if prompt else None
+                ),
                 skills=tuple(skills_raw),
             )
         )

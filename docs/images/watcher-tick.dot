@@ -1,0 +1,74 @@
+// The README diagram: one decision-latency watcher tick (observe -> decide ->
+// act) plus the nightly harness loop that produces the daily reflection report.
+//
+// The committed PNG is rendered from this source (run from the repo root):
+//   dot -Tpng -o docs/images/watcher-tick.png docs/images/watcher-tick.dot
+//
+// Node names follow src/hkrc/watcher.py (watcher.run: consume_board_events,
+// H1-H5 handlers, _native_command, format_message) and src/hkrc/harness_loop.py
+// (run: collect_*/_detect_all/analyze_candidates/apply_policy_gate/render_report).
+
+digraph watcher_tick {
+  rankdir=TB
+  bgcolor=white
+  newrank=true
+  compound=true
+  nodesep=0.45
+  ranksep=0.55
+
+  graph [fontname="Helvetica" fontsize=11 fontcolor="#51606f"]
+  node  [shape=box style="rounded,filled" fontname="Helvetica" fontsize=11
+         fillcolor="#eef2f7" color="#7d8da0" penwidth=1.2 margin="0.20,0.12"]
+  edge  [fontname="Helvetica" fontsize=9 color="#7d8da0" fontcolor="#51606f"]
+
+  // Cron triggers (both shims: scripts/watcher-cron.py, scripts/harness-loop-cron.py)
+  cron_watcher [label="cron — every 5m (cycle_interval_seconds)" shape=note
+                fillcolor="#f6f3ea" color="#b5a97f"]
+  cron_harness [label="cron — daily 03:00" shape=note
+                fillcolor="#f6f3ea" color="#b5a97f"]
+
+  // Shared target of reads and mutations: the native board databases
+  boards [label="native boards\n(kanban.db)" shape=cylinder fillcolor="#eef4ee"
+          color="#7d9a80"]
+
+  subgraph cluster_tick {
+    label="watcher tick — one `hkrc watcher` pass (watcher.run)"
+    labeljust=l
+    style="rounded,dashed"
+    color="#9aa9ba"
+
+    observe [label="observe\ndrain each board's event backlog\n(one persistent WebSocket per board)\n+ live state scans, mode=ro"]
+    decide  [label="decide — fail-closed, action-keyed\nH1 defect block → fix card · H2 supersede\non verified merge (git merge-base\n--is-ancestor) · H3 pick-gate guards ·\nH4 missing block event · H5 deadlock archive"]
+    act     [label="act — `hermes kanban` CLI\n(board-scoped argv, env scrubbed)\ncreate fix card · complete review as\nsuperseded · promote gated children ·\nunblock pick gate · write block event ·\narchive deadlock parent"]
+    digest  [label="digest (format_message)\nempty when nothing new — cron no_agent\ndelivers stdout; silence = no ping" shape=note
+             fillcolor="#f6f3ea" color="#b5a97f"]
+  }
+
+  subgraph cluster_harness {
+    label="daily reflection — one `hkrc harness-loop run` pass"
+    labeljust=l
+    style="rounded,dashed"
+    color="#9aa9ba"
+
+    collect [label="collect (read-only)\nsessions · board snapshots\ncurator reports · interventions\nfriction flags · git log"]
+    detect  [label="detect + revalidate\ndeterministic detectors (stdlib only)\nfingerprint dedupe, persistent\nopen-findings queue"]
+    llm     [label="one LLM call — analyze_candidates\nranked evidence in, validated proposals out\nfail-closed; analyzer failure routes zero tickets"
+             fillcolor="#fdf3e0" color="#c9a25e"]
+    report  [label="policy gate → daily reflection report\nlive: ≤2 applies, rest routed as tickets on\nthe hkrc board; render_report →\ncron no_agent (Telegram)"]
+  }
+
+  cron_watcher -> observe
+  observe -> decide
+  decide -> act [label="safe to act"]
+  decide -> observe [label="ambiguous → skip\n(fail-closed; failures keep\nretry eligibility)", style=dashed]
+  act -> observe [label="next pass — durable cursors +\naction keys (watcher-state.json)", style=dashed, constraint=false]
+  act -> digest
+  boards -> observe [label="mode=ro reads"]
+  act -> boards [label="mutations"]
+
+  cron_harness -> collect
+  collect -> detect
+  detect -> llm [label="ranked evidence"]
+  llm -> report [label="validated proposals"]
+  boards -> collect [label="temp snapshots"]
+}

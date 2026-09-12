@@ -162,12 +162,16 @@ def test_shipped_manifest_manages_harness_supervisor() -> None:
     # recreate must yield a working job, so the manifest has to carry one.
     assert supervisor.prompt is not None
     assert "supervisor-mission.md" in supervisor.prompt
-    # DEF-001: cron agents run with a profile-scoped $HOME, so a tilde
-    # mission path expands to a nonexistent file and the prompt's own
-    # failure branch fires on every tick. The path must be absolute.
+    # DEF-001: cron agents run with a profile-scoped $HOME and no cwd
+    # contract, so a tilde or relative mission path would resolve to a
+    # nonexistent file and the prompt's own failure branch would fire on
+    # every tick.  The shipped manifest stays portable via the
+    # {manifest_dir} placeholder; load_manifest materializes it to the
+    # manifest's own absolute directory (the installed config dir).
     assert "~/.hermes" not in supervisor.prompt
+    assert "{manifest_dir}" not in supervisor.prompt
     assert (
-        "/home/example-user/.hermes/hkrc/config/hkrc/supervisor-mission.md"
+        str((MANIFEST.parent / "supervisor-mission.md").resolve())
         in supervisor.prompt
     )
     # DEF-002: the mission file is the source of truth and says 05:00
@@ -175,6 +179,34 @@ def test_shipped_manifest_manages_harness_supervisor() -> None:
     # re-enter via the manifest.
     assert "05:00" in supervisor.prompt
     assert "noon" not in supervisor.prompt
+
+
+def test_manifest_prompt_materializes_manifest_dir_placeholder(
+    tmp_path: Path,
+) -> None:
+    """``{manifest_dir}`` in a manifest prompt becomes the manifest's own
+    absolute directory at load time — the portable stand-in for the
+    installed config dir (see DEF-001 in
+    test_shipped_manifest_manages_harness_supervisor)."""
+    manifest = tmp_path / "cron_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "name": "placeholder probe",
+                        "schedule": "every 5m",
+                        "prompt": "Read {manifest_dir}/mission.md verbatim.",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (loaded,) = load_manifest(manifest)
+    assert loaded.prompt == (
+        f"Read {manifest.resolve().parent}/mission.md verbatim."
+    )
 
 
 def test_plan_is_silent_for_converged_harness_supervisor() -> None:

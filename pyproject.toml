@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-kanban-recovery-controller"
-version = "0.15.15"
+version = "0.15.16"
 description = "Portable, instance-scoped foundation for manual Hermes Kanban blocker recovery"
 readme = "README.md"
 requires-python = ">=3.11"

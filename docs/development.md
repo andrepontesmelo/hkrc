@@ -24,15 +24,28 @@ scripts/             release, gates + cron entrypoints (hkrc_release.py, green.s
 systemd/             opt-in unit samples (operator installs, never the release)
 tests/               pytest suite (48 files)
 docs/                this index + architecture + outcome-guard +
-                     persona-matrix-runbook
+                     persona-matrix-runbook; images/ keeps the README diagram
+                     source next to its rendered PNG
 ```
+
+## README diagram
+
+`docs/images/watcher-tick.png` is rendered from the committed Graphviz source,
+not exported by hand (the exact command is also in a comment inside the
+`.dot`):
+
+```bash
+dot -Tpng -o docs/images/watcher-tick.png docs/images/watcher-tick.dot
+```
+
+Edit the `.dot`, re-render, and commit both files together.
 
 ## The local gate
 
 Everything must pass before a commit is considered done:
 
 ```bash
-uv run pytest        # full suite — currently 1062 tests
+uv run pytest        # full suite
 ```
 
 CI (`.github/workflows/ci.yml`) runs exactly this gate on Python 3.11 for
@@ -61,5 +74,10 @@ third-party dependencies; `uv run` manages its own environment.
 - [ ] `uv run pytest` green
 - [ ] New behavior covered by a test in `tests/`
 - [ ] Docs updated if the config surface or a contract changed
-- [ ] No absolute home-dir paths, IPs/hostnames, session/chat IDs, tokens, or
-      credentials in the diff
+- [ ] No absolute home-dir paths in the diff: shipped files (config/, src/,
+      scripts/, docs/) resolve instance paths from the operator home at
+      runtime (config knobs, env overrides, passwd home, `{manifest_dir}`
+      in the cron manifest).  `tests/test_portable_paths.py` greps every
+      tracked file for `/home/<username>` literals and enforces the
+      fixture-only allowlist documented in that test.  IPs/hostnames,
+      session/chat IDs, tokens, or credentials are also out.

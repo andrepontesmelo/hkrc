@@ -14,6 +14,10 @@ the orchestration layer itself.
 
 ## Reference in this repo
 
+- [Upstream mapping](upstream-mapping.md) — which Hermes fix would retire
+  each catalogued mechanism (watcher H1–H4 + deadlock archive, needs-input,
+  stale-block, review-gap), where the durable fix belongs, and the criteria
+  for retiring each HKRC watchdog.
 - [Outcome Guard](outcome-guard.md) — contract registration, child admission,
   and the `reference-transaction` hook that enforces protected canonical refs.
 - [Persona matrix runbook](persona-matrix-runbook.md) — one-time operator

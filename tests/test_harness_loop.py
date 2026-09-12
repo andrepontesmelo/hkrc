@@ -5069,7 +5069,7 @@ def test_profiles_root_flat_sessions_db_layout(tmp_path: Path) -> None:
 
     The old resolver returned sessions_db.parent.parent, which for the live
     layout (~/.hermes/state.db) climbed to $HOME and sent the assignee sweep
-    hunting $HOME/<assignee> — 10 nightly false positives.  With the
+    hunting /home/andre/<assignee> — 10 nightly false positives.  With the
     fix, the flat layout resolves via the config knob regardless of where
     the database sits.
     """
@@ -5103,6 +5103,24 @@ def test_profiles_root_env_fallback_survives_home_redirection(
     (tmp_path / "redirected-home").mkdir()
     assert _profiles_root(config) == tmp_path / "env-profiles"
     assert Path.home() == tmp_path / "redirected-home"  # prove the trap was set
+
+
+def test_instance_defaults_seed_from_operator_home() -> None:
+    """Portability contract (2026-09 sweep): the three instance defaults are
+    derived from the invoking operator's passwd home at import — never a
+    literal /home/<user> path and never $HOME (profile-redirected inside
+    worker sessions)."""
+    from hkrc.harness_loop import (
+        DEFAULT_ARCHLOOP_OUTPUT_DIR,
+        DEFAULT_DIST_SKILLS_ROOT,
+        DEFAULT_PROFILES_ROOT,
+        operator_home,
+    )
+
+    home = str(operator_home())
+    assert DEFAULT_DIST_SKILLS_ROOT == f"{home}/.hermes/dist-skills"
+    assert DEFAULT_PROFILES_ROOT == f"{home}/.hermes/profiles"
+    assert DEFAULT_ARCHLOOP_OUTPUT_DIR == f"{home}/.hermes/cron/output/5b3a912e5b3e"
 
 
 # --- CLI --------------------------------------------------------------------

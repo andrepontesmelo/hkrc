@@ -26,7 +26,7 @@ from test_harness_loop import (
 NOW = 1_788_000_000
 DAY = 86_400
 REAL_LEDGER = Path(
-    "/home/example-user/.hermes/hkrc/state/hkrc/harness-loop-state.json"
+    "/home/andre/.hermes/hkrc/state/hkrc/harness-loop-state.json"
 )
 
 

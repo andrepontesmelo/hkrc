@@ -24,7 +24,9 @@ from hkrc.harness_loop import collect_boards, detect_decision_latency, run  # no
 
 MACHINE = 1800
 HUMAN = 7 * 86400
-LIVE_ROOT = Path("/home/example-user/.hermes/kanban/boards")
+# Native boards root under the invoking operator's home, so the control
+# targets the live store of whoever runs it.
+LIVE_ROOT = Path("~/.hermes/kanban/boards").expanduser()
 
 
 def independent_audit(root: Path, now: int) -> dict[str, dict[str, list[str]]]:

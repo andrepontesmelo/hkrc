@@ -22,6 +22,7 @@ import socket
 import ssl
 import subprocess
 import struct
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -529,10 +530,13 @@ def validate_native_cli(cli: str) -> None:
         )
     if shutil.which(cli):
         return
+    # The example is resolved per operator so the hint stays portable and
+    # still names a concrete path for this machine's systemd logs.
+    example = Path.home() / ".local" / "bin" / "hermes"
     raise HandoffError(
         f"native cli '{cli}' not found on PATH '{seen_path}'; "
         "set [native] cli to an absolute path "
-        "(e.g. cli = \"/home/example-user/.local/bin/hermes\")"
+        f"(e.g. cli = \"{example}\")"
     )
 
 

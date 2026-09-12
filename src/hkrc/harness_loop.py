@@ -120,6 +120,26 @@ def _default_external_dirs() -> tuple[str, ...]:
     return tuple(str(Path(part).expanduser()) for part in spec.split(":"))
 
 
+def operator_home() -> Path:
+    """The invoking user's real home directory, independent of ``$HOME``.
+
+    Cron and worker contexts redirect ``HOME`` (profile-scoped sessions; the
+    archloop night shim applies the same passwd fix via ``getent``), so
+    ``Path.home()`` must not seed instance defaults (2026-08-15 pitfall).
+    The passwd database is the portable ground truth for any operator
+    account; environments without one fall back to ``Path.home()``.
+    """
+    try:
+        import pwd
+
+        pw_dir = pwd.getpwuid(os.getuid()).pw_dir
+        if pw_dir:
+            return Path(pw_dir)
+    except (ImportError, KeyError, OSError):
+        pass
+    return Path.home()
+
+
 DEFAULT_EXTERNAL_DIRS = _default_external_dirs()
 DEFAULT_HKRC_REPO = str(Path("~/git/hermes-kanban-recovery-controller").expanduser())
 # Worker-profile skill resolution ground truth (re-verified 2026-08-31,
@@ -127,23 +147,25 @@ DEFAULT_HKRC_REPO = str(Path("~/git/hermes-kanban-recovery-controller").expandus
 # ``skills.external_dirs`` -> the dist root.  The global ``~/.hermes/skills``
 # pool and profile-private skills dirs are NOT consulted — a skill living in
 # a profile-private dir resolves for NOBODY, not even that profile.
-DEFAULT_DIST_SKILLS_ROOT = "/home/example-user/.hermes/dist-skills"
+DEFAULT_DIST_SKILLS_ROOT = str(operator_home() / ".hermes" / "dist-skills")
 # Profiles root for the assignee-profile existence sweep (config_drift +
 # skill-pin detectors).  Resolved from config/env ONLY — never derived from
 # the sessions database path (the DB may sit at ``~/.hermes/state.db`` with
 # no ``main/`` segment, which sent the old ``parent.parent`` derivation to
 # the home directory: 10 nightly false positives, t_ae960b7d) and never via
-# ``Path.home()`` (profile-redirected inside a Hermes worker session,
-# 2026-08-15 pitfall).  Same instance-specific literal pattern as
-# DEFAULT_DIST_SKILLS_ROOT above.
-DEFAULT_PROFILES_ROOT = "/home/example-user/.hermes/profiles"
+# ``Path.home()``/``$HOME`` (profile-redirected inside a Hermes worker
+# session, 2026-08-15 pitfall) — the default seeds from the passwd home via
+# ``operator_home()``, same as DEFAULT_DIST_SKILLS_ROOT above.
+DEFAULT_PROFILES_ROOT = str(operator_home() / ".hermes" / "profiles")
 # Archloop nightly cron report root for the skip-streak sweep.  Resolved
-# config -> env -> this explicit instance literal (same pattern as
+# config -> env -> this seeded instance default (same pattern as
 # DEFAULT_PROFILES_ROOT above) — never derived from $HOME or a sessions-db
-# path (t_ae960b7d: a derived root silently resolved to $HOME and
+# path (t_ae960b7d: a derived root silently resolved to /home/<operator> and
 # produced 10 false HIGHs a night).  A missing/unreadable path yields zero
 # findings, never an exception (fail-safe, t_ba4092e4).
-DEFAULT_ARCHLOOP_OUTPUT_DIR = "/home/example-user/.hermes/cron/output"
+DEFAULT_ARCHLOOP_OUTPUT_DIR = str(
+    operator_home() / ".hermes" / "cron" / "output" / "5b3a912e5b3e"
+)
 # Skip classes the sweep treats as operator-fixable (config-overridable).
 # Only "dirty" is actionable by default (orchestrator correction 2026-09-01):
 # being off main is the NORMAL permanent state of a feature worktree
@@ -1346,10 +1368,10 @@ def _archloop_output_dir(config: "ControllerConfig") -> Path:
     """Archloop nightly-report root the skip-streak sweep reads.
 
     Explicit config knob wins, then ``HKRC_ARCHLOOP_OUTPUT_DIR``, then the
-    explicit instance default (``DEFAULT_ARCHLOOP_OUTPUT_DIR``, the same
-    literal pattern as ``DEFAULT_PROFILES_ROOT``).  Never derived from the
+    seeded instance default (``DEFAULT_ARCHLOOP_OUTPUT_DIR``, the same
+    pattern as ``DEFAULT_PROFILES_ROOT``).  Never derived from the
     sessions database path or ``Path.home()`` (see ``_profiles_root`` and
-    task t_ae960b7d: a derived root silently resolved to $HOME and
+    task t_ae960b7d: a derived root silently resolved to /home/<operator> and
     produced 10 false HIGHs a night).
     """
     configured = config.harness_loop.archloop_output_dir.strip()
@@ -7143,6 +7165,7 @@ __all__ = [
     "fingerprint",
     "git_log_since",
     "load_state",
+    "operator_home",
     "parse_git_log",
     "prune_stale_entries",
     "rank_open_findings",

@@ -135,9 +135,9 @@ def test_stream_config_rejects_enabled_mode_without_approved_wiring() -> None:
         ("ws://localhost/events", True),
         ("ws://[::1]/events", True),
         ("wss://dashboard.example.test/events", True),
-        ("wss://203.0.113.5/events", True),
+        ("wss://100.64.12.34/events", True),
         ("ws://dashboard.example.test/events", False),
-        ("ws://203.0.113.5/events", False),
+        ("ws://100.64.12.34/events", False),
     ],
 )
 def test_stream_endpoint_allows_plain_websocket_only_on_loopback(
