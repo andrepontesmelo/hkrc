@@ -24,7 +24,9 @@ from .harness_loop import (
     DECISION_LATENCY_HUMAN_SECONDS,
     DECISION_LATENCY_SECONDS,
     DEFAULT_DIST_SKILLS_ROOT,
+    DEFAULT_PROCESS_ALLOWLIST,
     DEFAULT_PROFILES_ROOT,
+    DIGEST_WEEKDAYS,
     HarnessLoopConfig,
 )
 
@@ -373,6 +375,60 @@ class ReviewGapConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SameFileGuardConfig:
+    """Gate and tunables for the same-file guard watcher (2026-09-15).
+
+    The guard is the mechanical gate for the AGENTS.md serialization rule
+    ("Same-file tasks serialize... Never dispatch two tasks that edit one
+    file"): every tick it extracts declared file paths from open
+    implementation cards' bodies and blocks each FOLLOWER (later-created
+    card) that overlaps a HOLDER (earlier-created card) on at least one
+    path. Cards already connected in a parent/child chain are exempt —
+    Hermes serializes those — as are cards younger than ``min_age_seconds``
+    (don't race a card mid-creation). ``auto_block`` false turns the guard
+    report-only. ``ignored_paths`` exists because ``scripts/green.sh`` is
+    quoted as the gate command in nearly every card body and would produce
+    universal false overlap. ``path_pattern`` is the repo-relative path
+    regex over card bodies; a card declaring ZERO paths is invisible to the
+    guard and gets one nag line instead of a block.
+    """
+
+    enabled: bool = True
+    min_age_seconds: int | float = 120
+    auto_block: bool = True
+    ignored_paths: tuple[str, ...] = ("scripts/green.sh",)
+    path_pattern: str = (
+        r"(?:src|tests|scripts|config|docs)/[A-Za-z0-9_./-]+\.(?:py|md|json|toml|sh|ya?ml)"
+    )
+    cli_timeout_seconds: int | float = 30.0
+    tick_timeout_seconds: int | float = 120.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("same_file_guard enabled must be a boolean")
+        if not _is_positive_number(self.min_age_seconds):
+            raise ConfigError("same_file_guard min_age_seconds must be a positive number")
+        if not isinstance(self.auto_block, bool):
+            raise ConfigError("same_file_guard auto_block must be a boolean")
+        if not isinstance(self.ignored_paths, tuple) or any(
+            not isinstance(path, str) or not path.strip() for path in self.ignored_paths
+        ):
+            raise ConfigError("same_file_guard ignored_paths must be a tuple of non-empty strings")
+        if len(set(self.ignored_paths)) != len(self.ignored_paths):
+            raise ConfigError("same_file_guard ignored_paths must not contain duplicates")
+        if not isinstance(self.path_pattern, str) or not self.path_pattern.strip():
+            raise ConfigError("same_file_guard path_pattern must be a non-empty string")
+        try:
+            re.compile(self.path_pattern)
+        except re.error as exc:
+            raise ConfigError(f"same_file_guard path_pattern is not a valid regex: {exc}") from exc
+        if not _is_positive_number(self.cli_timeout_seconds):
+            raise ConfigError("same_file_guard cli_timeout_seconds must be a positive number")
+        if not _is_positive_number(self.tick_timeout_seconds):
+            raise ConfigError("same_file_guard tick_timeout_seconds must be a positive number")
+
+
+@dataclass(frozen=True, slots=True)
 class WatcherConfig:
     """Gate and tunables for the decision-latency watcher (v0.9.0).
 
@@ -480,6 +536,7 @@ class ControllerConfig:
     stream: StreamConfig = field(default_factory=StreamConfig)
     needs_input_watcher: NeedsInputWatcherConfig = field(default_factory=NeedsInputWatcherConfig)
     review_gap: ReviewGapConfig = field(default_factory=ReviewGapConfig)
+    same_file_guard: SameFileGuardConfig = field(default_factory=SameFileGuardConfig)
     watcher: WatcherConfig = field(default_factory=WatcherConfig)
     harness_loop: HarnessLoopConfig = field(default_factory=HarnessLoopConfig)
     assist: AssistConfig = field(default_factory=AssistConfig)
@@ -568,6 +625,19 @@ class ControllerConfig:
             f"cli_timeout_seconds = {self.review_gap.cli_timeout_seconds}\n"
             f"tick_timeout_seconds = {self.review_gap.tick_timeout_seconds}\n"
             f"max_workers = {self.review_gap.max_workers}\n"
+            "\n[same_file_guard]\n"
+            "# Same-file serialization guard: blocks open impl cards whose body\n"
+            "# declares a file path already declared by an older open card (the\n"
+            "# HOLDER). parent/child-linked cards are exempt — Hermes serializes\n"
+            "# those. ignored_paths strips gate-command references (scripts/green.sh\n"
+            "# appears in nearly every card body and would false-overlap everything).\n"
+            f"enabled = {'true' if self.same_file_guard.enabled else 'false'}\n"
+            f"min_age_seconds = {self.same_file_guard.min_age_seconds}  # never race a card mid-creation\n"
+            f"auto_block = {'true' if self.same_file_guard.auto_block else 'false'}  # false = report only\n"
+            f"ignored_paths = {_toml_string_array(self.same_file_guard.ignored_paths)}\n"
+            f"path_pattern = {_toml_string(self.same_file_guard.path_pattern)}\n"
+            f"cli_timeout_seconds = {self.same_file_guard.cli_timeout_seconds}\n"
+            f"tick_timeout_seconds = {self.same_file_guard.tick_timeout_seconds}\n"
             "\n[watcher]\n"
             f"enabled = {'true' if self.watcher.enabled else 'false'}\n"
             f"reviewer_profiles = {_toml_string_array(self.watcher.reviewer_profiles)}  # empty = assignee contains 'reviewer'\n"
@@ -600,6 +670,10 @@ class ControllerConfig:
             f"analysis_max_attempts = {self.harness_loop.analysis_max_attempts}\n"
             f"escalate_after_nights = {self.harness_loop.escalate_after_nights}\n"
             f"chronic_after_nights = {self.harness_loop.chronic_after_nights}\n"
+            f"digest_after_nights = {self.harness_loop.digest_after_nights}  # nightly line below, one digest line at/above\n"
+            f"rollup_after_nights = {self.harness_loop.rollup_after_nights}  # digest-night rollup rung (operator action only)\n"
+            f"digest_weekday = {_toml_string(self.harness_loop.digest_weekday)}  # UTC weekday token; stateless, self-heals\n"
+            f"stall_after_nights = {self.harness_loop.stall_after_nights}  # consecutive zero-proposal/zero-routed nights before the stalled-loop HIGH\n"
             f"stale_retention_days = {self.harness_loop.stale_retention_days}\n"
             f"archloop_output_dir = {_toml_string(self.harness_loop.archloop_output_dir)}  # empty = HKRC_ARCHLOOP_OUTPUT_DIR env, else {DEFAULT_ARCHLOOP_OUTPUT_DIR} (enabled)\n"
             f"archloop_actionable_classes = {_toml_string_array(self.harness_loop.archloop_actionable_classes)}  # skip classes that escalate\n"
@@ -608,6 +682,8 @@ class ControllerConfig:
             f"decision_latency_seconds = {self.harness_loop.decision_latency_seconds}  # machine-blocked defect threshold\n"
             f"decision_latency_human_seconds = {self.harness_loop.decision_latency_human_seconds}  # needs_input waits on Andre; default 7d\n"
             f"cron_jobs_path = {_toml_string(self.harness_loop.cron_jobs_path)}  # empty = crons.resolve_cron_store_path (native profile / HERMES_HOME / active_profile / default home)\n"
+            f"process_budget = {self.harness_loop.process_budget}  # artifact-amendment routes/night (separate from max_applies; 0 = off)\n"
+            f"process_allowlist = {_toml_string_array(self.harness_loop.process_allowlist)}  # artifact homes; empty = channel off (ADD needs an allowlisted dir)\n"
             "\n[assist]\n"
             f"human_in_loop = {'true' if self.assist.human_in_loop else 'false'}\n"
             "\n[outcome_guard]\n"
@@ -655,6 +731,7 @@ def load_config(path: Path) -> ControllerConfig:
         # settings (the alias must behave identically to the new name).
         needs_input_watcher = raw.get("needs_input_watcher", raw.get("blocker_ping", {}))
         review_gap = raw.get("review_gap", {})
+        same_file_guard = raw.get("same_file_guard", {})
         watcher = raw.get("watcher", {})
         harness_loop = raw.get("harness_loop", {})
         assist = raw.get("assist", {})
@@ -678,6 +755,8 @@ def load_config(path: Path) -> ControllerConfig:
         raise ConfigError("needs_input_watcher config section must be a table")
     if not isinstance(review_gap, dict):
         raise ConfigError("review_gap config section must be a table")
+    if not isinstance(same_file_guard, dict):
+        raise ConfigError("same_file_guard config section must be a table")
     if not isinstance(watcher, dict):
         raise ConfigError("watcher config section must be a table")
     if not isinstance(harness_loop, dict):
@@ -787,6 +866,38 @@ def load_config(path: Path) -> ControllerConfig:
         raise ConfigError("review_gap tick_timeout_seconds must be a positive number")
     if not _is_positive_number(review_gap_max_workers, integers_only=True):
         raise ConfigError("review_gap max_workers must be a positive integer")
+    same_file_guard_enabled = same_file_guard.get("enabled", True)
+    same_file_guard_min_age = same_file_guard.get("min_age_seconds", 120)
+    same_file_guard_auto_block = same_file_guard.get("auto_block", True)
+    same_file_guard_ignored_paths = same_file_guard.get("ignored_paths", ["scripts/green.sh"])
+    same_file_guard_path_pattern = same_file_guard.get(
+        "path_pattern",
+        r"(?:src|tests|scripts|config|docs)/[A-Za-z0-9_./-]+\.(?:py|md|json|toml|sh|ya?ml)",
+    )
+    same_file_guard_cli_timeout = same_file_guard.get("cli_timeout_seconds", 30.0)
+    same_file_guard_tick_timeout = same_file_guard.get("tick_timeout_seconds", 120.0)
+    if not isinstance(same_file_guard_enabled, bool):
+        raise ConfigError("same_file_guard enabled must be a boolean")
+    if not _is_positive_number(same_file_guard_min_age):
+        raise ConfigError("same_file_guard min_age_seconds must be a positive number")
+    if not isinstance(same_file_guard_auto_block, bool):
+        raise ConfigError("same_file_guard auto_block must be a boolean")
+    if not isinstance(same_file_guard_ignored_paths, list) or any(
+        not isinstance(path, str) or not path.strip() for path in same_file_guard_ignored_paths
+    ):
+        raise ConfigError("same_file_guard ignored_paths must be an array of non-empty strings")
+    if len(set(same_file_guard_ignored_paths)) != len(same_file_guard_ignored_paths):
+        raise ConfigError("same_file_guard ignored_paths must not contain duplicates")
+    if not isinstance(same_file_guard_path_pattern, str) or not same_file_guard_path_pattern.strip():
+        raise ConfigError("same_file_guard path_pattern must be a non-empty string")
+    try:
+        re.compile(same_file_guard_path_pattern)
+    except re.error as exc:
+        raise ConfigError(f"same_file_guard path_pattern is not a valid regex: {exc}") from exc
+    if not _is_positive_number(same_file_guard_cli_timeout):
+        raise ConfigError("same_file_guard cli_timeout_seconds must be a positive number")
+    if not _is_positive_number(same_file_guard_tick_timeout):
+        raise ConfigError("same_file_guard tick_timeout_seconds must be a positive number")
     watcher_enabled = watcher.get("enabled", True)
     watcher_reviewer_profiles = watcher.get("reviewer_profiles", [])
     watcher_fix_assignee = watcher.get("fix_assignee", "developer")
@@ -836,6 +947,10 @@ def load_config(path: Path) -> ControllerConfig:
     harness_loop_analysis_max_attempts = harness_loop.get("analysis_max_attempts", 2)
     harness_loop_escalate_after_nights = harness_loop.get("escalate_after_nights", 7)
     harness_loop_chronic_after_nights = harness_loop.get("chronic_after_nights", 21)
+    harness_loop_digest_after_nights = harness_loop.get("digest_after_nights", 3)
+    harness_loop_rollup_after_nights = harness_loop.get("rollup_after_nights", 14)
+    harness_loop_digest_weekday = harness_loop.get("digest_weekday", "sun")
+    harness_loop_stall_after_nights = harness_loop.get("stall_after_nights", 7)
     harness_loop_stale_retention_days = harness_loop.get("stale_retention_days", 14)
     harness_loop_archloop_output_dir = harness_loop.get(
         "archloop_output_dir", DEFAULT_ARCHLOOP_OUTPUT_DIR
@@ -850,6 +965,10 @@ def load_config(path: Path) -> ControllerConfig:
         "archloop_high_nights", ARCHLOOP_HIGH_NIGHTS
     )
     harness_loop_cron_jobs_path = harness_loop.get("cron_jobs_path", "")
+    harness_loop_process_budget = harness_loop.get("process_budget", 1)
+    harness_loop_process_allowlist = harness_loop.get(
+        "process_allowlist", list(DEFAULT_PROCESS_ALLOWLIST)
+    )
     harness_loop_decision_latency = harness_loop.get(
         "decision_latency_seconds", DECISION_LATENCY_SECONDS
     )
@@ -945,6 +1064,35 @@ def load_config(path: Path) -> ControllerConfig:
             "harness_loop chronic_after_nights must be >= escalate_after_nights"
         )
     if (
+        not isinstance(harness_loop_digest_after_nights, int)
+        or isinstance(harness_loop_digest_after_nights, bool)
+        or harness_loop_digest_after_nights <= 0
+    ):
+        raise ConfigError("harness_loop digest_after_nights must be a positive integer")
+    if (
+        not isinstance(harness_loop_rollup_after_nights, int)
+        or isinstance(harness_loop_rollup_after_nights, bool)
+        or harness_loop_rollup_after_nights <= 0
+    ):
+        raise ConfigError("harness_loop rollup_after_nights must be a positive integer")
+    if harness_loop_rollup_after_nights < harness_loop_digest_after_nights:
+        raise ConfigError(
+            "harness_loop rollup_after_nights must be >= digest_after_nights"
+        )
+    if (
+        not isinstance(harness_loop_digest_weekday, str)
+        or harness_loop_digest_weekday.strip().casefold()[:3] not in DIGEST_WEEKDAYS
+    ):
+        raise ConfigError(
+            "harness_loop digest_weekday must be one of " + ", ".join(DIGEST_WEEKDAYS)
+        )
+    if (
+        not isinstance(harness_loop_stall_after_nights, int)
+        or isinstance(harness_loop_stall_after_nights, bool)
+        or harness_loop_stall_after_nights <= 0
+    ):
+        raise ConfigError("harness_loop stall_after_nights must be a positive integer")
+    if (
         not isinstance(harness_loop_stale_retention_days, int)
         or isinstance(harness_loop_stale_retention_days, bool)
         or harness_loop_stale_retention_days <= 0
@@ -986,6 +1134,25 @@ def load_config(path: Path) -> ControllerConfig:
     if not _is_positive_number(harness_loop_decision_latency_human):
         raise ConfigError(
             "harness_loop decision_latency_human_seconds must be a positive number"
+        )
+    if (
+        not isinstance(harness_loop_process_budget, int)
+        or isinstance(harness_loop_process_budget, bool)
+        or harness_loop_process_budget < 0
+    ):
+        raise ConfigError(
+            "harness_loop process_budget must be a non-negative integer"
+        )
+    if not isinstance(harness_loop_process_allowlist, list) or any(
+        not isinstance(pattern, str) or not pattern.strip()
+        for pattern in harness_loop_process_allowlist
+    ):
+        raise ConfigError(
+            "harness_loop process_allowlist must be an array of non-empty strings"
+        )
+    if len(set(harness_loop_process_allowlist)) != len(harness_loop_process_allowlist):
+        raise ConfigError(
+            "harness_loop process_allowlist must not contain duplicates"
         )
     outcome_guard_protected_refs = outcome_guard.get(
         "protected_refs", ["refs/heads/main"]
@@ -1047,6 +1214,15 @@ def load_config(path: Path) -> ControllerConfig:
             tick_timeout_seconds=review_gap_tick_timeout,
             max_workers=review_gap_max_workers,
         ),
+        same_file_guard=SameFileGuardConfig(
+            enabled=same_file_guard_enabled,
+            min_age_seconds=same_file_guard_min_age,
+            auto_block=same_file_guard_auto_block,
+            ignored_paths=tuple(same_file_guard_ignored_paths),
+            path_pattern=same_file_guard_path_pattern,
+            cli_timeout_seconds=same_file_guard_cli_timeout,
+            tick_timeout_seconds=same_file_guard_tick_timeout,
+        ),
         watcher=WatcherConfig(
             enabled=watcher_enabled,
             reviewer_profiles=tuple(watcher_reviewer_profiles),
@@ -1088,6 +1264,10 @@ def load_config(path: Path) -> ControllerConfig:
             analysis_max_attempts=harness_loop_analysis_max_attempts,
             escalate_after_nights=harness_loop_escalate_after_nights,
             chronic_after_nights=harness_loop_chronic_after_nights,
+            digest_after_nights=harness_loop_digest_after_nights,
+            rollup_after_nights=harness_loop_rollup_after_nights,
+            digest_weekday=harness_loop_digest_weekday,
+            stall_after_nights=harness_loop_stall_after_nights,
             stale_retention_days=harness_loop_stale_retention_days,
             archloop_output_dir=harness_loop_archloop_output_dir,
             archloop_actionable_classes=tuple(harness_loop_archloop_classes),
@@ -1096,6 +1276,8 @@ def load_config(path: Path) -> ControllerConfig:
             decision_latency_seconds=harness_loop_decision_latency,
             decision_latency_human_seconds=harness_loop_decision_latency_human,
             cron_jobs_path=harness_loop_cron_jobs_path,
+            process_budget=harness_loop_process_budget,
+            process_allowlist=tuple(harness_loop_process_allowlist),
         ),
         assist=AssistConfig(human_in_loop=assist_human_in_loop),
         outcome_guard=OutcomeGuardConfig(

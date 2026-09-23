@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "key": "one-thread-per-incident",
+  "target_path": "~/.hermes/dist-skills/one-thread-per-incident/SKILL.md",
+  "kind": "ADD",
+  "content_file": "SKILL.md",
+  "source_task": "t_ba158b41",
+  "rationale": "The reask detector's remediation is a working-agreement artifact (one thread per incident; session_search handoff), not an HKRC source change, so it routes through the process-amendment channel against an allowlisted artifact home."
+}

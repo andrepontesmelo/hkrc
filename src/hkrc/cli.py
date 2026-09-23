@@ -47,8 +47,10 @@ from .harness_loop import (
     STATE_FILENAME as HARNESS_LOOP_STATE_FILENAME,
     HarnessLoopConfig,
     HarnessLoopError,
+    apply_disposition,
     default_state_path as harness_loop_default_state_path,
     run as run_harness_loop,
+    run_shipped_fix_backfill,
 )
 from .live import build_live_stream_wiring
 from .simulation import run_simulation
@@ -73,6 +75,11 @@ from .stale_block_watch import (
     run as run_stale_block_watch,
 )
 from .state import ControllerState, StateError
+from .same_file_guard import (
+    STATE_FILENAME as SAME_FILE_GUARD_STATE_FILENAME,
+    default_state_path as same_file_guard_default_state_path,
+    run as run_same_file_guard,
+)
 from .watcher import (
     STATE_FILENAME as WATCHER_STATE_FILENAME,
     WatcherError,
@@ -410,6 +417,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_gap.set_defaults(handler=_review_gap)
 
+    same_file_guard = subparsers.add_parser(
+        "same-file-guard",
+        help=(
+            "block open implementation cards that declare a file path already "
+            "declared by an older open card (same-file serialization) — "
+            "designed for cron no_agent delivery; silent when nothing new"
+        ),
+    )
+    same_file_guard.add_argument("--config", type=Path, default=default_config_path())
+    same_file_guard.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help=(
+            "dedupe state file (default: <instance-root>/state/hkrc/"
+            f"{SAME_FILE_GUARD_STATE_FILENAME})"
+        ),
+    )
+    same_file_guard.add_argument(
+        "--now", type=int, help="override Unix time for deterministic runs and tests"
+    )
+    same_file_guard.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report intended blocks/comments without mutating the board",
+    )
+    same_file_guard.set_defaults(handler=_same_file_guard)
+
     watcher = subparsers.add_parser(
         "watcher",
         help=(
@@ -494,6 +529,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--now", type=int, help="override Unix time for deterministic runs and tests"
     )
     harness_loop_run.set_defaults(handler=_harness_loop)
+    harness_loop_disposition = harness_loop_sub.add_parser(
+        "disposition",
+        help=(
+            "operator one-token disposition on exactly one working-set "
+            "finding: defer | promote (routes one impl+review pair under the "
+            "existing budget) | resolve | stale"
+        ),
+    )
+    harness_loop_disposition.add_argument(
+        "--config", type=Path, default=default_config_path()
+    )
+    harness_loop_disposition.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help=(
+            "harness-loop dedupe state file "
+            f"(default: <instance-root>/state/hkrc/{HARNESS_LOOP_STATE_FILENAME})"
+        ),
+    )
+    harness_loop_disposition.add_argument(
+        "fingerprint_prefix",
+        help="fingerprint prefix matching exactly one working-set finding",
+    )
+    harness_loop_disposition.add_argument(
+        "disposition",
+        choices=("defer", "promote", "resolve", "stale"),
+        help="human execution only — never auto-run by the loop",
+    )
+    harness_loop_disposition.add_argument(
+        "--now", type=int, help="override Unix time for deterministic runs and tests"
+    )
+    harness_loop_disposition.set_defaults(handler=_harness_loop_disposition)
     harness_loop_simulate = harness_loop_sub.add_parser(
         "simulate",
         help=(
@@ -514,6 +582,46 @@ def build_parser() -> argparse.ArgumentParser:
         "--now", type=int, help="override Unix time for deterministic runs and tests"
     )
     harness_loop_simulate.set_defaults(handler=_harness_loop_simulate)
+    harness_loop_retro = harness_loop_sub.add_parser(
+        "retro",
+        help=(
+            "one-shot historical shipped-fix retro: classify every merge in "
+            "git history (detector-born / ledger-miss / blind-spot), report "
+            "the coverage metrics and the honest ledger depth bounds; writes "
+            "typed detector_requirement ledger entries only with --no-dry-run "
+            "(never a kanban card)"
+        ),
+    )
+    harness_loop_retro.add_argument("--config", type=Path, default=default_config_path())
+    harness_loop_retro.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help=(
+            "harness-loop ledger file "
+            f"(default: <instance-root>/state/hkrc/{HARNESS_LOOP_STATE_FILENAME})"
+        ),
+    )
+    harness_loop_retro.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=True,
+        help="report only; leaves the ledger byte-identical (default)",
+    )
+    harness_loop_retro.add_argument(
+        "--no-dry-run",
+        dest="dry_run",
+        action="store_false",
+        help=(
+            "persist backfill: true detector_requirement entries for blind "
+            "spots (still no kanban card, still no routing)"
+        ),
+    )
+    harness_loop_retro.add_argument(
+        "--now", type=int, help="override Unix time for deterministic runs and tests"
+    )
+    harness_loop_retro.set_defaults(handler=_harness_loop_retro)
 
     crons = subparsers.add_parser(
         "crons",
@@ -1068,6 +1176,20 @@ def _review_gap(args: argparse.Namespace) -> int:
     return 0
 
 
+def _same_file_guard(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    state_file = args.state_file or same_file_guard_default_state_path(config.state_db)
+    digest = run_same_file_guard(
+        config,
+        state_file,
+        now=getattr(args, "now", None),
+        dry_run=args.dry_run,
+    )
+    if digest:
+        print(digest)
+    return 0
+
+
 def _watcher(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     adapters, credentials = build_watcher_wiring(config)
@@ -1090,6 +1212,35 @@ def _harness_loop(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     state_file = args.state_file or harness_loop_default_state_path(config.state_db)
     report = run_harness_loop(
+        config,
+        now=getattr(args, "now", None),
+        dry_run=args.dry_run,
+        state_path=state_file,
+    )
+    if report:
+        print(report)
+    return 0
+
+
+def _harness_loop_disposition(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    state_file = args.state_file or harness_loop_default_state_path(config.state_db)
+    print(
+        apply_disposition(
+            args.fingerprint_prefix,
+            args.disposition,
+            config,
+            state_path=state_file,
+            now=getattr(args, "now", None),
+        )
+    )
+    return 0
+
+
+def _harness_loop_retro(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    state_file = args.state_file or harness_loop_default_state_path(config.state_db)
+    report = run_shipped_fix_backfill(
         config,
         now=getattr(args, "now", None),
         dry_run=args.dry_run,

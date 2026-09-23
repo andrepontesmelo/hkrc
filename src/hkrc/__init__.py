@@ -1,6 +1,6 @@
 """Standalone Hermes Kanban blocker-recovery controller."""
 
-__version__ = "0.15.16"
+__version__ = "0.15.19"
 
 from .config import (
     AssistConfig,

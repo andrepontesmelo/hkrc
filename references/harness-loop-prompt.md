@@ -75,6 +75,25 @@ etc.) is off-limits: read-only sensors.
   retry. The loop NEVER edits, version-bumps, or commits the canonical checkout;
   the pytest gate and conventional commit happen in the worktree by the
   implementation worker, and the reviewer merges. Red tests = reviewer blocks.
+- **PROCESS ROUTE (max `process_budget` per run, default 1 — budgeted
+  separately from the max_applies ticket slots)**: a finding whose remediation
+  is an ARTIFACT amendment rather than an HKRC source fix routes one
+  human-authored remediation pack from `config/hkrc/process_remediations/<key>/`
+  as an implementation + parent-linked review card pair on board `hkrc`
+  (`process-amendment: <key>` / `review: process-amendment: <key> (<impl>)`,
+  idempotency keys `harness-proc-impl:{fp}` / `harness-proc-review:{fp}`,
+  workspace `dir:<artifact directory>`). Artifact homes are allowlisted by
+  `process_allowlist` (the supervisor mission file plus
+  `~/.hermes/dist-skills/*`); ADD proposals must land in an allowlisted
+  DIRECTORY and AMEND targets must match a glob themselves, and a target inside
+  the HKRC repo is rejected with "repo targets route via hkrc channel". The
+  analyzer may rank/select packs but NEVER authors amendment prose: the pack
+  owns the target, the ADD/AMEND kind, the verbatim before-text, and the
+  content. The reviewer verifies the before-text by SUBSTRING match against the
+  live artifact (mismatch = reject, never fuzzy-match), takes a dated
+  `<artifact>.bak-<YYYYMMDD>` backup before the first AMEND edit, applies, and
+  quotes the applied after-text in the resolution comment. Deploy stays
+  operator-controlled.
 - **SUGGEST**: items that fail the apply bar, in the report, with fingerprints recorded for
   cooldown.
 
@@ -202,6 +221,27 @@ etc.) is off-limits: read-only sensors.
    restart), or "none".
 6. **"What's right"** — up to 3 items.
 7. **ONE next action doable in under 2 minutes.**
+
+### Escalation ladder (rungs A/B/C — t_c9da2f07)
+
+- **Rung A (nightly line)** — every finding open `< digest_after_nights` nights (default
+  3) keeps its full line plus an `(open k nights)` age, counted in whole UTC nights from
+  `first_seen`.
+- **Rung B (aged backlog)** — findings open `>= digest_after_nights` nights collapse into
+  ONE nightly summary line (`N findings open >=3 nights — full digest <weekday>`). The full
+  per-finding digest — identified by `[key]`, `needs_input` findings first, with their
+  problem/solution lines — renders on `digest_weekday` (default `sun`, UTC). An escalated
+  entry keeps its nightly line: escalation composes with the ladder, it is never batched
+  away.
+- **Rung C (weekly rollup)** — on the digest night, findings open `>= rollup_after_nights`
+  nights (default 14) also get a rollup line with a deterministic proposed disposition
+  (`promote` / `resolve` / `mark-stale` / `defer`) and the exact operator command
+  `hkrc harness-loop disposition <fingerprint-prefix> <promote|defer|resolve|stale>`.
+  The rollup is a proposal only: the loop never promotes, resolves or stales a finding by
+  itself, and `promote` still has to satisfy the apply budget/cooldown.
+- **Next-action dedupe** — the same next action on consecutive nights is annotated
+  `(same as last night, x2)`, `x3`, ...; from the 3rd identical night the digest repeats it.
+  The streak lives in the state file, so it survives a restart; a dry run never writes it.
 
 ## Shaping corrections (why the design is what it is)
 

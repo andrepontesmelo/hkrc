@@ -24,6 +24,13 @@
       "deliver": "local"
     },
     {
+      "name": "kanban same-file guard",
+      "schedule": "every 10m",
+      "no_agent": true,
+      "script": "same-file-guard.py",
+      "deliver": "local"
+    },
+    {
       "name": "hkrc archloop nightly",
       "schedule": "30 0 * * *",
       "no_agent": true,

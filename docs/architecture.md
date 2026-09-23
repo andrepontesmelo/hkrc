@@ -65,6 +65,15 @@ hermes kanban CLI (argv subprocesses, ambient HERMES_KANBAN_* scrubbed)
   orchestration/hkrc fixes. Dry-run by default; the cron shim flips
   `--no-dry-run` only after operator review. Prompt verbatim in
   [references/harness-loop-prompt.md](../references/harness-loop-prompt.md).
+- **`src/hkrc/shipped_fix_retro.py` — shipped-fix retro pre-pass (design
+  #6).** Deterministic, read-only pass inside the nightly run: builds a
+  register of shipped fixes (merges citing kanban task ids), classifies each
+  as `detector-born` / `ledger-miss` / `blind-spot` from card lineage,
+  ledger findings, and sha-embedded release versions, and renders the
+  report section with the rolling-30d metrics. Blind spots queue a typed
+  `detector_requirement` ledger entry (`fix_status="requirement"`, dormant:
+  never a finding, never a card — gap cards stay human-promotion only).
+  `hkrc harness-loop retro` runs the one-shot backfill.
 - **`src/hkrc/config.py`, `state.py`, `crons.py` — instance plumbing.**
   Instance-scoped config + controller-owned SQLite state under the instance
   root; cron-manifest reconciliation. The release never installs, enables, or

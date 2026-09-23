@@ -26,7 +26,7 @@ from test_harness_loop import (
 NOW = 1_788_000_000
 DAY = 86_400
 REAL_LEDGER = Path(
-    "/home/andre/.hermes/hkrc/state/hkrc/harness-loop-state.json"
+    "/home/example-user/.hermes/hkrc/state/hkrc/harness-loop-state.json"
 )
 
 
@@ -134,10 +134,20 @@ def test_run_wayfinder_chronic_inline(tmp_path: Path) -> None:
 
     # Dry-run: report only — no prune line, no backup, byte-identical file.
     report = run(config, now=NOW, dry_run=True, state_path=state_file)
+    # Rung A composes with display escalation: an escalated entry keeps its
+    # nightly line, while the plain aged backlog collapses into the one
+    # summary line (t_c9da2f07 rung B).
     assert "MEDIUM→HIGH (CHRONIC, 29 nights)" in report
     assert "MEDIUM→HIGH (8 nights)" in report
-    assert "MEDIUM — Slow decision on blocked tasks" in report
-    assert "pruned" not in report
+    # Rung B (t_c9da2f07, main) collapses the plain aged backlog: the only
+    # non-escalated entry here is aged, so the digest line below counts it
+    # and it renders no "MEDIUM — ..." line of its own (the pre-ladder
+    # assertion main's own suite replaced).
+    assert "1 finding open >=3 nights — full digest Sunday" in report
+    # Dry-run guard is about the prune ACTION line, not the word: the
+    # loop self-health trend line legitimately reports "0 pruned, 0
+    # resolved" (a rolling counter) even in a dry run.
+    assert "stale finding older than" not in report
     assert (
         hashlib.sha256(state_file.read_bytes()).hexdigest() == before_hash
     ), "dry-run must not mutate the state file"
@@ -375,6 +385,10 @@ def test_run_dry_run_zero_tickets_and_byte_identical_state(
             target_path=str(thing),
             verify_path=str(thing),
             verify_text="OLD_WORD",
+            # Rung A fixture (age 0): the night cadence keeps a young
+            # carried-open entry in its labeled section.
+            first_seen=NOW,
+            last_seen=NOW,
         )
     ]
     _open_proof(tmp_path, entries)

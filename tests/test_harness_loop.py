@@ -294,6 +294,8 @@ def make_config(
     config_drift_allowed_profiles: tuple[str, ...] = (),
     decision_latency_seconds: int = 1800,
     decision_latency_human_seconds: int = 7 * 86400,
+    process_budget: int = 1,
+    process_allowlist: tuple[str, ...] | None = None,
 ) -> ControllerConfig:
     profiles = tmp_path / "profiles"
     return ControllerConfig(
@@ -330,6 +332,16 @@ def make_config(
             config_drift_allowed_profiles=config_drift_allowed_profiles,
             decision_latency_seconds=decision_latency_seconds,
             decision_latency_human_seconds=decision_latency_human_seconds,
+            process_budget=process_budget,
+            # Hermetic by default: the production default homes point at the
+            # operator's REAL ~/.hermes (supervisor mission file + dist
+            # skills), so every fixture pins its own tmp_path roots unless the
+            # caller passes the production tuple explicitly.
+            process_allowlist=(
+                process_allowlist
+                if process_allowlist is not None
+                else (str(tmp_path / "dist" / "*"),)
+            ),
         ),
         watcher=WatcherConfig(reviewer_profiles=reviewer_profiles),
     )
@@ -406,6 +418,7 @@ def queue_entry(
     last_suggestion: int | None = None,
     match_subject: str = "",
     last_deferral_reason: str = "",
+    remediation_key: str = "",
 ) -> dict:
     """Build one persisted ``open_findings`` queue entry (v0.15.3 schema)."""
     return {
@@ -422,6 +435,7 @@ def queue_entry(
         "verify_path": verify_path,
         "verify_text": verify_text,
         "match_subject": match_subject,
+        "remediation_key": remediation_key,
         "first_seen": first_seen,
         "last_seen": last_seen,
         "occurrence_count": occurrence_count,
@@ -2333,12 +2347,14 @@ def test_run_already_fixed_proposal_no_routing_blocker(tmp_path: Path) -> None:
                 "id": "s_q_a",
                 "source": "cli",
                 "started_at": NOW - 2000,
+                "input_tokens": 61_000,
                 "first_messages": ["Why is the SSE lag persistent?"],
             },
             {
                 "id": "s_q_b",
                 "source": "cli",
                 "started_at": NOW - 1000,
+                "input_tokens": 62_000,
                 "first_messages": ["Why is the SSE lag persistent?"],
             },
         ],
@@ -2348,6 +2364,12 @@ def test_run_already_fixed_proposal_no_routing_blocker(tmp_path: Path) -> None:
         sessions_db=sessions_db,
         hkrc_repo=repo,
         analysis_profile="nightly-analysis",
+        # t_ba158b41: this test is about the ANALYZER lane.  The fixture repo
+        # ships no remediation pack, so the independent process-amendment
+        # channel would defer the freshly detected reask group and add its own
+        # routing-blocker line; that channel's fail-loud behaviour is pinned in
+        # tests/test_process_channel.py.
+        process_budget=0,
     )
     state_file = tmp_path / "state" / "hkrc" / "harness-loop-state.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2368,11 +2390,13 @@ def test_run_already_fixed_proposal_no_routing_blocker(tmp_path: Path) -> None:
             session_row(
                 "s_q_a",
                 started_at=NOW - 2000,
+                input_tokens=61_000,
                 first_message="Why is the SSE lag persistent?",
             ),
             session_row(
                 "s_q_b",
                 started_at=NOW - 1000,
+                input_tokens=62_000,
                 first_message="Why is the SSE lag persistent?",
             ),
         )
@@ -3503,8 +3527,18 @@ def test_detect_bloat_skips_archived(tmp_path: Path) -> None:
 
 def test_detect_reask_groups_identical_first_questions() -> None:
     sessions = [
-        session_row("s_a", started_at=NOW - 100, first_message="how do I fix the SSE lag?"),
-        session_row("s_b", started_at=NOW - 90, first_message="How do I fix the SSE lag?"),
+        session_row(
+            "s_a",
+            started_at=NOW - 100,
+            input_tokens=12_000,
+            first_message="how do I fix the SSE lag?",
+        ),
+        session_row(
+            "s_b",
+            started_at=NOW - 90,
+            input_tokens=13_000,
+            first_message="How do I fix the SSE lag?",
+        ),
         session_row("s_c", started_at=NOW - 80, first_message="unrelated question"),
     ]
     findings = detect_reask(sessions)
@@ -3528,11 +3562,13 @@ def test_detect_reask_skips_compaction_handoffs() -> None:
         session_row(
             "s_gen_a",
             started_at=NOW - 80,
+            input_tokens=21_000,
             first_message="Run the simulation now of the 2am run, not dry run",
         ),
         session_row(
             "s_gen_b",
             started_at=NOW - 70,
+            input_tokens=22_000,
             first_message="Run the simulation now of the 2am run, not dry run",
         ),
     ]
@@ -3698,8 +3734,18 @@ def test_detect_reask_still_flags_real_questions_resembling_probes() -> None:
     """
     ping_question = "Is the PING endpoint down again?"
     ping_pair = [
-        session_row("s_ping_q_a", started_at=NOW - 100, first_message=ping_question),
-        session_row("s_ping_q_b", started_at=NOW - 90, first_message=ping_question),
+        session_row(
+            "s_ping_q_a",
+            started_at=NOW - 100,
+            input_tokens=31_000,
+            first_message=ping_question,
+        ),
+        session_row(
+            "s_ping_q_b",
+            started_at=NOW - 90,
+            input_tokens=32_000,
+            first_message=ping_question,
+        ),
     ]
     findings = detect_reask(ping_pair)
     assert len(findings) == 1
@@ -3711,8 +3757,18 @@ def test_detect_reask_still_flags_real_questions_resembling_probes() -> None:
         "persona tier map, and what is the correct override?"
     )
     migration_pair = [
-        session_row("s_glm_a", started_at=NOW - 80, first_message=migration_question),
-        session_row("s_glm_b", started_at=NOW - 70, first_message=migration_question),
+        session_row(
+            "s_glm_a",
+            started_at=NOW - 80,
+            input_tokens=41_000,
+            first_message=migration_question,
+        ),
+        session_row(
+            "s_glm_b",
+            started_at=NOW - 70,
+            input_tokens=42_000,
+            first_message=migration_question,
+        ),
     ]
     findings = detect_reask(migration_pair)
     assert len(findings) == 1
@@ -3759,14 +3815,57 @@ def test_detect_reask_still_flags_genuine_repeats_mixed_with_noise() -> None:
             ),
         ),
         session_row("s_hi", started_at=NOW - 110, source="telegram", first_message="Hi"),
-        session_row("s_q_a", started_at=NOW - 100, first_message=question),
-        session_row("s_q_b", started_at=NOW - 90, first_message=question),
+        session_row(
+            "s_q_a", started_at=NOW - 100, input_tokens=51_000, first_message=question
+        ),
+        session_row(
+            "s_q_b", started_at=NOW - 90, input_tokens=52_000, first_message=question
+        ),
     ]
     findings = detect_reask(sessions)
     assert len(findings) == 1
     assert findings[0].pattern == "reask"
     assert findings[0].severity == "high"
     assert "2 fresh sessions" in findings[0].evidence[0]
+
+
+def test_detect_reask_skips_zero_token_groups() -> None:
+    """Regression (2026-09-15 loop, fingerprint reask:a9d72beb1b68): a group
+    of identical first questions whose sessions collectively recorded zero
+    input tokens is a failed-start/retry pair, never re-derived work, so it
+    must not surface as the HIGH token-saver (live: "0 input tokens total").
+    """
+    retry_pair = [
+        session_row(
+            "20260907_130944_202c2c",
+            started_at=NOW - 100,
+            input_tokens=0,
+            first_message="Why is the SSE lag persistent?",
+        ),
+        session_row(
+            "20260907_131054_18644c",
+            started_at=NOW - 90,
+            input_tokens=0,
+            first_message="Why is the SSE lag persistent?",
+        ),
+    ]
+    assert detect_reask(retry_pair) == ()
+    # Partial accounting is still cost: one session that really processed
+    # the question keeps the group reportable.
+    half_processed = [
+        retry_pair[0],
+        session_row(
+            "s_real",
+            started_at=NOW - 80,
+            input_tokens=9_000,
+            first_message="Why is the SSE lag persistent?",
+        ),
+    ]
+    findings = detect_reask(half_processed)
+    assert len(findings) == 1
+    assert findings[0].pattern == "reask"
+    assert findings[0].severity == "high"
+    assert "9000 input tokens total" in findings[0].evidence[0]
 
 
 # --- git log + outage latency ----------------------------------------------
@@ -3901,6 +4000,91 @@ def test_detect_fix_chain_below_threshold_is_silent_unless_override(
     findings = detect_fix_chain(boards, threshold=3)
     assert len(findings) == 1
     assert findings[0].key == "hkrc:t_ab12cd34"
+
+
+def test_detect_fix_chain_id_less_cards_with_distinct_titles_stay_separate(
+    tmp_path: Path,
+) -> None:
+    """Five id-less fix/impl cards with distinct titles are NOT one chain.
+
+    Regression for the synthetic ``fix-chain:hkrc:unattributed`` finding: the
+    id-less fallback must group by a normalized title stem so unrelated
+    id-less fixes never manufacture a single whack-a-mole chain.
+    """
+    root = tmp_path / "boards"
+    make_board(
+        root,
+        "hkrc",
+        [
+            {
+                "id": f"t_distinct{i}",
+                "title": f"fix: unrelated thing {i}",
+                "status": "todo",
+                "created_at": NOW - 100 - i,
+            }
+            for i in range(5)
+        ],
+    )
+    boards = collect_boards(root, now=NOW, window_hours=24)
+    assert detect_fix_chain(boards) == ()
+    assert detect_fix_chain(boards, threshold=5) == ()
+
+
+def test_detect_fix_chain_id_less_cards_sharing_a_stem_form_one_chain(
+    tmp_path: Path,
+) -> None:
+    """Id-less titles sharing one normalized stem still group as one chain.
+
+    The stem drops the "fix:"/"impl:" prefix word and stopwords ("the", "a",
+    "in", ...), so alternating "fix: sse lag" / "impl: the SSE lag" titles
+    land in the same lineage and the finding key is ``fix-chain:hkrc:sse
+    lag``.
+    """
+    root = tmp_path / "boards"
+    make_board(
+        root,
+        "hkrc",
+        [
+            {
+                "id": f"t_stem{i}",
+                "title": ("fix: sse lag" if i % 2 == 0 else "impl: the SSE lag"),
+                "status": "todo",
+                "created_at": NOW - 100 - i,
+            }
+            for i in range(5)
+        ],
+    )
+    boards = collect_boards(root, now=NOW, window_hours=24)
+    findings = detect_fix_chain(boards, threshold=5)
+    assert len(findings) == 1
+    assert findings[0].pattern == "fix-chain"
+    assert findings[0].key == "hkrc:sse lag"
+    assert findings[0].severity == "medium"
+    assert findings[0].apply_kind == "none"
+
+
+def test_detect_fix_chain_id_less_empty_titles_still_form_one_chain(
+    tmp_path: Path,
+) -> None:
+    """Titles with no usable tokens keep the literal 'unattributed' root."""
+    root = tmp_path / "boards"
+    make_board(
+        root,
+        "hkrc",
+        [
+            {
+                "id": f"t_blank{i}",
+                "title": "fix:",
+                "status": "todo",
+                "created_at": NOW - 100 - i,
+            }
+            for i in range(5)
+        ],
+    )
+    boards = collect_boards(root, now=NOW, window_hours=24)
+    findings = detect_fix_chain(boards, threshold=5)
+    assert len(findings) == 1
+    assert findings[0].key == "hkrc:unattributed"
 
 
 # --- decision latency -------------------------------------------------------
@@ -5069,7 +5253,7 @@ def test_profiles_root_flat_sessions_db_layout(tmp_path: Path) -> None:
 
     The old resolver returned sessions_db.parent.parent, which for the live
     layout (~/.hermes/state.db) climbed to $HOME and sent the assignee sweep
-    hunting /home/andre/<assignee> — 10 nightly false positives.  With the
+    hunting /home/example-user/<assignee> — 10 nightly false positives.  With the
     fix, the flat layout resolves via the config knob regardless of where
     the database sits.
     """
@@ -5333,6 +5517,52 @@ def test_analysis_prompt_no_findings_omits_example_line() -> None:
     assert "never the bare 'key' field" in prompt
 
 
+def test_analysis_prompt_declares_readonly_file_tools(tmp_path: Path) -> None:
+    """The prompt states the analyzer's exact read-only tool surface.
+
+    The analysis stage was repo-blind (profile 'authoritative' ran with kanban
+    tools only), so the prompt never mentioned any file tool.  The profile now
+    grants read_file/search_files and nothing writable; the prompt must name
+    that surface (and the repo root) so the model reads the target file
+    instead of guessing its current text.
+    """
+    repo = make_hkrc_repo(tmp_path)
+    prompt = build_analysis_prompt("{}", hkrc_repo=repo)
+    assert "read-only file tools (read_file, search_files)" in prompt
+    assert str(repo) in prompt
+    assert "no write, edit, patch, or shell tools exist" in prompt
+    # Direct callers that pass only a document still get the surface, minus root.
+    bare = build_analysis_prompt("{}")
+    assert "read-only file tools (read_file, search_files)" in bare
+    assert "no write, edit, patch, or shell tools exist" in bare
+    assert str(repo) not in bare
+
+
+def test_analysis_prompt_requires_reading_before_quoting() -> None:
+    """Read-then-quote is instructed; the no-invention backstop stays verbatim."""
+    prompt = build_analysis_prompt("{}")
+    assert "read the named target file with read_file BEFORE quoting 'before'" in prompt
+    assert "do not restate file contents in your reply" in prompt
+    # the fail-closed sentence the grounding gate mirrors is unchanged
+    assert (
+        "if you cannot quote the exact current text, emit a no-action "
+        "proposal instead of inventing one" in prompt
+    )
+
+
+def test_analysis_prompt_embeds_no_source_bodies(tmp_path: Path) -> None:
+    """The prompt carries file NAMES only; no file body is injected."""
+    repo = make_hkrc_repo(tmp_path)
+    marker = "SECRET_BODY_MARKER_9f3a"
+    body = (marker + "\n") * 400  # ~10 KiB the analyzer must read itself
+    (repo / "src" / "hkrc" / "big.py").write_text(body, encoding="utf-8")
+    prompt = build_analysis_prompt("{}", hkrc_repo=repo)
+    assert marker not in prompt  # no body text, only the inventory line
+    assert "- src/hkrc/big.py" in prompt
+    assert len(prompt) < 8000  # inventory-only growth, no source dump
+    assert len(prompt) < len(body)
+
+
 def test_run_directory_targets_rejected_report_names_reason_no_kanban(
     tmp_path: Path,
 ) -> None:
@@ -5477,11 +5707,13 @@ def test_run_fresh_and_carried_counts_exclude_carried(tmp_path: Path) -> None:
             {
                 "id": "s_a",
                 "started_at": NOW - 3600,
+                "input_tokens": 71_000,
                 "first_messages": ["how do I deploy the controller?"],
             },
             {
                 "id": "s_b",
                 "started_at": NOW - 1800,
+                "input_tokens": 72_000,
                 "first_messages": ["how do I deploy the controller?"],
             },
         ],
@@ -5796,6 +6028,66 @@ def test_pin_sweep_assignee_no_profile(tmp_path: Path) -> None:
     assert missing[0].severity == "high"
     assert missing[0].apply_kind == "none"
     assert "backend-dev" in " ".join(missing[0].evidence)
+
+
+def test_pin_sweep_assignee_default_implicit_resolves(tmp_path: Path) -> None:
+    # ``default`` is Hermes core's implicit profile lane: dispatch resolves it
+    # with no directory under the profiles root (hermes_cli.kanban_db.
+    # list_profiles_on_disk adds it whenever the default root exists).  Cards
+    # assigned to it do dispatch, so flagging them was a false HIGH
+    # (t_a4db669f: three live casa cards, two of which had already run under
+    # PROFILE default).  The prefix form resolves through the same split.
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_implicit",
+                "title": "impl: implicit default assignee",
+                "status": "todo",
+                "assignee": "default",
+                "created_at": NOW - 100,
+            },
+            {
+                "id": "t_implicit_directive",
+                "title": "impl: implicit default assignee with directive",
+                "status": "blocked",
+                "assignee": "default: owner sign-off",
+                "created_at": NOW - 100,
+            },
+        ],
+    )
+    assert findings == ()
+
+
+def test_pin_sweep_assignee_default_exempt_but_ghost_persona_fires(
+    tmp_path: Path,
+) -> None:
+    # The implicit-default exemption must stay scoped: a genuinely missing
+    # persona in the same sweep is still a HIGH.
+    findings = sweep_boards(
+        tmp_path,
+        [
+            {
+                "id": "t_implicit",
+                "title": "impl: implicit default assignee",
+                "status": "todo",
+                "assignee": "default",
+                "created_at": NOW - 100,
+            },
+            {
+                "id": "t_ghost",
+                "title": "impl: orphan assignee",
+                "status": "todo",
+                "assignee": "backend-dev",
+                "created_at": NOW - 100,
+            },
+        ],
+    )
+    missing = [f for f in findings if f.pattern == "assignee-no-profile"]
+    assert len(missing) == 1
+    assert missing[0].key == "fixture:t_ghost"
+    assert missing[0].severity == "high"
+    assert missing[0].apply_kind == "none"
 
 
 def test_pin_sweep_assignee_directive_prefix_is_profile(tmp_path: Path) -> None:

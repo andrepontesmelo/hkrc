@@ -36,6 +36,8 @@ SERVICE_TEMPLATE = Path("systemd") / "hkrc.service.in"
 SERVICE_RELATIVE_PATH = Path("systemd") / "hkrc.service"
 PROMPT_TEMPLATE = Path("config") / "hkrc" / "needs-input-watcher-prompt.txt"
 MANIFEST_TEMPLATE = Path("config") / "hkrc" / "cron_manifest.json"
+ANALYZER_PLUGIN_PAYLOAD = Path("config") / "hkrc" / "analyzer-readonly-plugin"
+ANALYZER_PLUGIN_FILES = ("plugin.yaml", "__init__.py")
 DOCS_DIR = Path("docs")
 OUTCOME_GUARD_ASSETS = Path("config") / "hkrc" / "outcome-guard-assets.json"
 OUTCOME_GUARD_EXAMPLE_CONTRACT = (
@@ -99,6 +101,7 @@ def install(root: Path, source: Path, version: str, *, replace: bool = False) ->
     _activate(root, version, old_current=None)
     write_service_unit(root, source, replace=False)
     _run_cron_sync_preview(root)
+    print(_provision_hint(root))
     print(f"installed version={version} instance_root={root}")
 
 
@@ -114,7 +117,18 @@ def upgrade(root: Path, source: Path, version: str, *, replace: bool = False) ->
     _activate(root, version, old_current=old_current)
     write_service_unit(root, source, replace=False)
     _run_cron_sync_preview(root)
+    print(_provision_hint(root))
     print(f"upgraded version={version} previous={old_current.name} instance_root={root}")
+
+
+def _provision_hint(root: Path) -> str:
+    """One-line pointer to the analyzer profile repair path (kanban t_1e29fe8d)."""
+
+    return (
+        "analyzer readonly plugin payload seeded under config/hkrc/ — repair the "
+        "analysis profile with: python3 scripts/provision_analyzer_profile.py "
+        f"--config {root / 'config' / 'hkrc' / 'config.toml'}"
+    )
 
 
 def _run_cron_sync_preview(root: Path) -> None:
@@ -174,6 +188,7 @@ def _validate_source(source: Path) -> None:
         MANIFEST_TEMPLATE,
         DOCS_DIR,
         OUTCOME_GUARD_ASSETS,
+        *(ANALYZER_PLUGIN_PAYLOAD / name for name in ANALYZER_PLUGIN_FILES),
     ):
         if not (source / relative).is_file() and not (source / relative).is_dir():
             raise ReleaseError(f"source repository is missing {relative}: {source}")
@@ -259,8 +274,10 @@ def _sync_instance_files(root: Path, version: str) -> None:
     manifest into the instance config directory. The prompt seed never
     overwrites an existing file: the prompt is operator-customizable, so
     install/upgrade/rollback preserve a local copy once it exists. The cron
-    manifest is the repository-controlled source of truth for `hkrc crons
-    sync`, so it is refreshed unconditionally on every release.
+    manifest and the analyzer read-only plugin payload are repository-controlled
+    sources of truth, so they are refreshed unconditionally on every release
+    (kanban t_1e29fe8d); the profile-home repair itself is the explicit
+    provisioner's job, never the installer's.
     """
 
     for skill_dir, dest_name in SKILL_DIRS:
@@ -276,6 +293,21 @@ def _sync_instance_files(root: Path, version: str) -> None:
         shutil.copytree(source, temporary)
         shutil.rmtree(destination, ignore_errors=True)
         temporary.rename(destination)
+
+    plugin_destination = root / ANALYZER_PLUGIN_PAYLOAD
+    plugin_source = root / "releases" / version / ANALYZER_PLUGIN_PAYLOAD
+    if not plugin_source.is_dir():
+        # Older materialized releases predate the analyzer payload (kanban
+        # t_1e29fe8d): mirror the skill-sync contract and drop any stale
+        # installed copy rather than crashing after the symlinks flipped.
+        shutil.rmtree(plugin_destination, ignore_errors=True)
+    else:
+        plugin_destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = plugin_destination.with_name(f".{plugin_destination.name}.tmp")
+        shutil.rmtree(temporary, ignore_errors=True)
+        shutil.copytree(plugin_source, temporary, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.rmtree(plugin_destination, ignore_errors=True)
+        temporary.rename(plugin_destination)
 
     prompt_destination = root / PROMPT_TEMPLATE
     if not prompt_destination.exists():

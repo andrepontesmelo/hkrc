@@ -135,9 +135,9 @@ def test_stream_config_rejects_enabled_mode_without_approved_wiring() -> None:
         ("ws://localhost/events", True),
         ("ws://[::1]/events", True),
         ("wss://dashboard.example.test/events", True),
-        ("wss://100.64.12.34/events", True),
+        ("wss://203.0.113.5/events", True),
         ("ws://dashboard.example.test/events", False),
-        ("ws://100.64.12.34/events", False),
+        ("ws://203.0.113.5/events", False),
     ],
 )
 def test_stream_endpoint_allows_plain_websocket_only_on_loopback(
@@ -561,3 +561,70 @@ def test_cli_init_writes_discovery_section_with_default_threshold(tmp_path: Path
     config = load_config(config_path)
     assert config.unclaimed_child_after_seconds == 1800
     assert "[discovery]" in config_path.read_text(encoding="utf-8")
+
+
+def test_harness_loop_digest_keys_round_trip(tmp_path: Path) -> None:
+    # t_c9da2f07: the escalation-ladder cadence keys are config-driven and
+    # must survive a write/load cycle at both default and custom values.
+    config = ControllerConfig(
+        instance_name="work-a",
+        native_boards_root=tmp_path / "native-boards",
+        state_db=tmp_path / "controller.sqlite3",
+    )
+    path = tmp_path / "config.toml"
+    write_config(path, config)
+
+    text = path.read_text(encoding="utf-8")
+    assert "digest_after_nights = 3" in text
+    assert "rollup_after_nights = 14" in text
+    assert 'digest_weekday = "sun"' in text
+    assert load_config(path) == config
+
+    custom = ControllerConfig(
+        instance_name="work-a",
+        native_boards_root=tmp_path / "native-boards",
+        state_db=tmp_path / "controller.sqlite3",
+        harness_loop=HarnessLoopConfig(
+            digest_after_nights=5,
+            rollup_after_nights=30,
+            digest_weekday="thu",
+        ),
+    )
+    write_config(path, custom, overwrite=True)
+
+    assert load_config(path) == custom
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        'digest_weekday = "someday"',
+        "digest_weekday = 3",
+        "digest_after_nights = 0",
+        "rollup_after_nights = 0",
+        "rollup_after_nights = 2\ndigest_after_nights = 3",
+    ],
+)
+def test_harness_loop_config_rejects_bad_ladder_keys(
+    tmp_path: Path, fragment: str
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f"""format_version = 1
+
+[instance]
+name = "work-a"
+native_boards_root = "/tmp/hermes/kanban/boards"
+
+[controller]
+state_db = "/tmp/hermes/state/hkrc/state.sqlite3"
+
+[harness_loop]
+{fragment}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="digest|rollup"):
+        load_config(path)
+

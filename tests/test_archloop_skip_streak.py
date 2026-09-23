@@ -216,3 +216,128 @@ def test_resolve_archloop_output_dir_config_then_env_then_default(tmp_path: Path
     assert "andre" not in str(_archloop_output_dir(empty)) or str(
         _archloop_output_dir(empty)
     ) == DEFAULT_ARCHLOOP_OUTPUT_DIR
+
+
+# --- t_495f8ac7: the launcher's indented porcelain listing becomes evidence -----
+
+
+def listing_report(
+    stamp: str, *, skip_lines: str = "SKIPPED dirty (1): campcli", listings: str = ""
+) -> str:
+    """A report body with the launcher's per-repo block and digest block."""
+    return (
+        f"archloop-night {stamp}\n"
+        "SKIP campcli: dirty canonical checkout\n"
+        f"{listings}"
+        f"{skip_lines}\n"
+        f"{listings}"
+        "(nothing started this night)\n"
+    )
+
+
+def write_report(root: Path, name: str, body: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / name).write_text(body, encoding="utf-8")
+
+
+def test_indented_listing_is_captured_as_finding_evidence(tmp_path: Path) -> None:
+    root = tmp_path / "cron-output"
+    for day in range(1, 5):
+        write_report(
+            root,
+            f"2026-08-{day:02d}.md",
+            listing_report(
+                f"2026-08-{day:02d} 00:30:00",
+                listings="  ?? .horizon/\n  M src/tracked.txt\n",
+            ),
+        )
+
+    findings = detect_archloop_skip_streak(
+        root, actionable_classes=("dirty",), medium_nights=3, high_nights=7
+    )
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.apply_kind == "none"
+    evidence = "\n".join(finding.evidence)
+    assert "dirty entries named by the latest report" in evidence
+    assert "?? .horizon/" in evidence and "M src/tracked.txt" in evidence
+
+
+def test_listing_is_attributed_to_the_right_repo(tmp_path: Path) -> None:
+    body = (
+        "archloop-night 2026-08-01 00:30:00\n"
+        "SKIP campcli: dirty canonical checkout\n"
+        "  ?? .horizon/\n"
+        "SKIP ynab-pilot: dirty canonical checkout\n"
+        "  ?? notes.txt\n"
+        "SKIPPED dirty (2): campcli ynab-pilot\n"
+        "  ?? .horizon/\n"
+        "  ?? notes.txt\n"
+        "(nothing started this night)\n"
+    )
+    root = tmp_path / "cron-output"
+    for day in range(1, 5):
+        write_report(root, f"2026-08-{day:02d}.md", body)
+
+    findings = detect_archloop_skip_streak(
+        root, actionable_classes=("dirty",), medium_nights=3, high_nights=7
+    )
+
+    evidence = {finding.key: "\n".join(finding.evidence) for finding in findings}
+    assert set(evidence) == {"campcli", "ynab-pilot"}
+    assert "?? .horizon/" in evidence["campcli"]
+    assert "notes.txt" not in evidence["campcli"]
+    assert "notes.txt" in evidence["ynab-pilot"]
+
+
+def test_listing_capture_is_capped(tmp_path: Path) -> None:
+    listing = "".join(f"  ?? junk-{index:02d}.txt\n" for index in range(45))
+    root = tmp_path / "cron-output"
+    for day in range(1, 5):
+        write_report(
+            root,
+            f"2026-08-{day:02d}.md",
+            listing_report(f"2026-08-{day:02d} 00:30:00", listings=listing),
+        )
+
+    findings = detect_archloop_skip_streak(
+        root, actionable_classes=("dirty",), medium_nights=3, high_nights=7
+    )
+
+    evidence = "\n".join(findings[0].evidence)
+    assert "junk-00.txt" in evidence
+    assert "junk-39.txt" in evidence
+    assert "junk-40.txt" not in evidence
+    assert "(+5 more listing lines)" in evidence
+
+
+def test_suggestion_names_the_exact_plan_command(tmp_path: Path) -> None:
+    root = tmp_path / "cron-output"
+    for day in range(1, 5):
+        write_report(
+            root, f"2026-08-{day:02d}.md", listing_report(f"2026-08-{day:02d} 00:30:00")
+        )
+
+    findings = detect_archloop_skip_streak(
+        root, actionable_classes=("dirty",), medium_nights=3, high_nights=7
+    )
+
+    suggestion = findings[0].suggestion
+    assert "bash scripts/archloop-night-cron.sh plan --repo ~/git/campcli" in suggestion
+    assert findings[0].apply_kind == "none"
+
+
+def test_report_without_a_listing_keeps_the_plain_evidence_shape(
+    tmp_path: Path,
+) -> None:
+    nights = [f"2026-08-{day:02d} 00:30:00" for day in range(1, 5)]
+    reports = make_reports(tmp_path / "cron-output", nights)
+
+    findings = detect_archloop_skip_streak(
+        reports, actionable_classes=("dirty",), medium_nights=3, high_nights=7
+    )
+
+    evidence = "\n".join(findings[0].evidence)
+    assert "dirty entries named" not in evidence
+    assert "campcli" in evidence and "for 4 consecutive" in evidence

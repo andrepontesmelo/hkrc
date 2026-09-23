@@ -34,6 +34,7 @@ EXPECTED_NAMES = {
     "kanban needs input watcher",
     "kanban stale block watch",
     "kanban review gap watchdog",
+    "kanban same-file guard",
     "hkrc archloop nightly",
     "harness-learning-loop (daily 7-day self-review)",
     "HKRC harness supervisor",
@@ -130,6 +131,10 @@ def test_shipped_manifest_declares_all_expected_jobs() -> None:
     review_gap = by_name["kanban review gap watchdog"]
     assert review_gap.no_agent and review_gap.script == "review-gap.py"
     assert review_gap.deliver == "local"
+
+    same_file_guard = by_name["kanban same-file guard"]
+    assert same_file_guard.no_agent and same_file_guard.script == "same-file-guard.py"
+    assert same_file_guard.deliver == "local"
 
     archloop = by_name["hkrc archloop nightly"]
     assert archloop.no_agent and archloop.script == "archloop-night-cron.sh"
@@ -310,7 +315,7 @@ def test_store_path_falls_back_to_default_home(tmp_path: Path, monkeypatch: pyte
 
 def test_plan_empty_store_creates_every_manifest_job() -> None:
     actions = plan_sync(manifest_jobs(), [])
-    assert [action.kind for action in actions] == ["create"] * 6
+    assert [action.kind for action in actions] == ["create"] * 7
     assert {action.job.name for action in actions} == EXPECTED_NAMES
 
 
@@ -323,6 +328,7 @@ def test_plan_is_silent_when_live_matches_manifest() -> None:
         job("b", "kanban review gap watchdog", schedule=manifest["kanban review gap watchdog"].schedule, script="review-gap.py"),
     ]
     stale = job("e", "kanban stale block watch", schedule=manifest["kanban stale block watch"].schedule, script="stale-block-watch.py")
+    guard = job("g", "kanban same-file guard", schedule=manifest["kanban same-file guard"].schedule, script="same-file-guard.py")
     harness = job("c", "harness-learning-loop (daily 7-day self-review)", schedule=manifest["harness-learning-loop (daily 7-day self-review)"].schedule, no_agent=True, script="harness-loop.py")
     archloop = job("d", "hkrc archloop nightly", schedule=manifest["hkrc archloop nightly"].schedule, script="archloop-night-cron.sh")
     supervisor = job(
@@ -334,13 +340,13 @@ def test_plan_is_silent_when_live_matches_manifest() -> None:
         deliver="origin",
         skills=["kanban-operations", "cron-automation", "local-deployment", "tts-with-me", "hermes-agent", "diagnosing-bugs"],
     )
-    assert plan_sync(manifest_jobs(), [live[0], live[1], stale, harness, archloop, supervisor]) == []
+    assert plan_sync(manifest_jobs(), [live[0], live[1], stale, guard, harness, archloop, supervisor]) == []
 
 
 def test_plan_resumes_paused_job() -> None:
     paused = job("paused1", "kanban needs input watcher", enabled=False)
     actions = plan_sync(manifest_jobs(), [paused])
-    assert len(actions) == 6
+    assert len(actions) == 7
     resume = next(action for action in actions if action.kind == "resume")
     assert resume.job_id == "paused1"
     assert resume.job.name == "kanban needs input watcher"
@@ -387,7 +393,7 @@ def test_plan_never_touches_unlisted_jobs() -> None:
     ]
     actions = plan_sync(manifest_jobs(), live)
     assert all(action.job.name in EXPECTED_NAMES for action in actions)
-    assert len(actions) == 6  # all manifest jobs missing -> creates only
+    assert len(actions) == 7  # all manifest jobs missing -> creates only
 
 
 def test_plan_raises_on_ambiguous_name_match() -> None:
@@ -419,7 +425,7 @@ def test_dry_run_reports_without_writing(tmp_path: Path, monkeypatch: pytest.Mon
     out = capsys.readouterr().out
     assert "create" in out and "update" in out
     assert store_path(tmp_path).read_bytes() == before  # nothing mutated
-    assert len(actions) == 6  # 1 update + 5 creates
+    assert len(actions) == 7  # 1 update + 6 creates
 
 
 def test_run_sync_end_to_end_and_idempotence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -431,7 +437,7 @@ def test_run_sync_end_to_end_and_idempotence(tmp_path: Path, monkeypatch: pytest
 
     # Fresh run: empty store -> all six manifest jobs created.
     actions = run_sync(config, MANIFEST)
-    assert [action.kind for action in actions] == ["create"] * 6
+    assert [action.kind for action in actions] == ["create"] * 7
     live = read_store(tmp_path)
     assert {job["name"] for job in live} == EXPECTED_NAMES
     blocker = next(job for job in live if job["name"] == "kanban needs input watcher")

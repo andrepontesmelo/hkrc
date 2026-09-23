@@ -1,0 +1,3 @@
+name: readonly-file
+version: "1.0.0"
+description: "Read-only file tools (read_file + search_files) as a standalone toolset for profiles that must not write — used by the HKRC harness-loop analyzer session (profile authoritative)."

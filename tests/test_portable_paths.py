@@ -43,6 +43,9 @@ ALLOWLIST: dict[str, str] = {
     "tests/test_harness_loop.py": "quoted incident narrative in a docstring",
     # Ledger round-trip fixture state path (shape only; never opened).
     "tests/test_ledger_roundtrip.py": "fixture state path",
+    # Operator-specific mission document: the installed instance paths ARE
+    # the contract.
+    "config/hkrc/supervisor-mission.md": "operator-specific mission document: the installed instance paths ARE the contract",
 }
 
 

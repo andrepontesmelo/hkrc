@@ -165,6 +165,18 @@ pass is the lower lane of the same diagram — the report it renders is the
 daily reflection, delivered through cron (Telegram) with silence when there
 is nothing new.
 
+Each run also carries a **shipped-fix retro** section: every merge since the
+last run that references a kanban `t_…` id is classified as `detector-born`
+(the card came from a detector finding), `ledger-miss` (the ledger already
+held that pattern, with the nights-early latency), or `blind-spot` (neither —
+a typed `detector_requirement` ledger entry is queued for human promotion).
+It reports `detector-caught share` (rolling 30d) and `median nights-early`.
+The section is report-only: it never creates a kanban card, and any failure
+degrades to a labelled line without touching the run or a deploy. Run the
+one-shot historical pass with `hkrc harness-loop retro` (dry-run by default;
+`--no-dry-run` writes `backfill: true` entries over surviving git history and
+ledger backups, and the report states the ledger depth it could reach).
+
 ## Deep dives
 
 - [Docs index](docs/index.md) — start here: architecture, development, outcome
